@@ -88,3 +88,6 @@ def main():
     model.save_quantized(quantized_model_dir, use_safetensors=True)
 
     print(f"量化后的模型已保存到: {quantized_model_dir}")
+
+if __name__ == "__main__":
+    main()
