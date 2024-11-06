@@ -42,7 +42,7 @@ def main():
         )
         model = AutoGPTQForCausalLM.from_quantized(
             quantized_model_name,
-            device="cuda"
+            device="cuda:0"
         )
     elif args.offical_quantized_model:
         print("start testing offical quantized model...")
