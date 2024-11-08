@@ -201,7 +201,7 @@ def dict2matrix(state_dic, keys=None):
     for key in keys[1:]:
         param = state_dic[key]
         if len(list(param.size())) == 0:
-            param_vector = torch.cat((param_vector, param.view(1).type(torch.float32)), 0)
+            param_vector = torch.cat((param_vector, param.view(1)), 0)
         else:
             param_vector = torch.cat((param_vector, param.flatten()), 0)
     return param_vector.data
@@ -217,12 +217,14 @@ def matrix2dict(x, dnn_struct):
 
 def fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, args, fwdgrad_pool):
     # 加权聚合fwdgrad
-    # avg_global_grad = []
-    # global_para = {k:v,k:v...}
-    # tensor_sample = torch.zeros_like(fwdgrad_pool[0])
-    # for client_id in range(args.n_parties):
-    #     tensor_sample += fwdgrad_pool[client_id] * fed_avg_freqs[client_id]
-    avg_global_grad = matrix2dict(torch.mean(torch.stack(list(fwdgrad_pool.values())), dim=0), net_struct)
+    trainable_params = [p for p in net.parameters() if p.requires_grad]
+    # avg_global_grad = [torch.zeros_like(p) for p in trainable_params]
+    for layer_id, p in enumerate(trainable_params):
+        p.grad = torch.zeros_like(p)
+        for client_id in range(args.n_parties):
+            p.grad += fwdgrad_pool[client_id][layer_id] * fed_avg_freqs[client_id]
+    avg_global_grad = [p.grad.data.clone() for p in trainable_params]
+    # avg_global_grad = matrix2dict(torch.mean(torch.stack(list(fwdgrad_pool.values())), dim=0), net_struct)
     # 更新global参数
     # 用优化器
     # if current_round < self.warmup_rounds:
@@ -232,10 +234,9 @@ def fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, ar
     #         0.0, float(self.args.comm_round - current_round) / float(max(1, self.args.comm_round - self.warmup_rounds))
     #     )
 
-    trainable_params = [p for p in net.parameters() if p.requires_grad]
 
-    for param, layer_grad in zip(trainable_params, avg_global_grad.values()):
-        param.grad = layer_grad
+    # for param, layer_grad in zip(trainable_params, avg_global_grad.values()):
+    #     param.grad = layer_grad
     nn.utils.clip_grad_norm_(net.parameters(), 1.0)
     optimizer.step()
     optimizer.zero_grad()
@@ -416,32 +417,26 @@ def train_local_twostage(net,args,param_dict):
     return output['embedding_dict']
 
 @torch.no_grad
-def computejvp(net, p_params, trainable_tensor, trainable_struct, x, labels, args):
+def computejvp(net, p_params, trainable_params, trainable_struct, x, labels, args, loss):
     """
     Calculations Jacobian-vector product using numerical differentiation
     """
     # with autocast():
-    criterion = nn.CrossEntropyLoss().to(args.device)
-    param = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
-    param1 = matrix2dict(trainable_tensor + p_params, trainable_struct)
+    # param = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
+    # param1 = {k: v + p_params[i] for i, (k,v) in enumerate(trainable_params.items())}
+    # param1 = matrix2dict(trainable_tensor + p_params, trainable_struct)
 
+    # net.load_state_dict(param1, strict=False)
     for k, v in net.named_parameters():
         if v.requires_grad == True:
-            v.data = param1[k]
+            v.data = trainable_params[k] + p_params[k] * args.h
     y1 = net(x)
     pred1 = y1['logits']
-    terbulence_loss = criterion(pred1, labels)
+    terbulence_loss = F.cross_entropy(pred1, labels)
 
-    for k, v in net.named_parameters():
-        if v.requires_grad == True:
-            v.data = param[k]
-    y2 = net(x)
-    pred2 = y2['logits']
-    loss = criterion(pred2,labels)
-
-    avg_loss = (terbulence_loss + loss)/2
+    # avg_loss = (terbulence_loss + loss)/2
     jvp = (terbulence_loss - loss)/(args.h)
-    return avg_loss, jvp
+    return loss, jvp
 
 def computevar(fwdgrad_list):
     n = len(fwdgrad_list)
@@ -569,11 +564,12 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
-    trainable_para = {k: v for k, v in net.named_parameters() if v.requires_grad == True}
+    trainable_para = {k: v.data.clone() for k, v in net.named_parameters() if v.requires_grad == True}
     trainable_struct = dict([(k, v.shape) for k, v in trainable_para.items()])
-    trainable_tensor = dict2matrix(trainable_para)
+    # trainable_tensor = dict2matrix(trainable_para)
+    trainable_tensor = trainable_para.values()
     # 积累本轮fwdgrad
-    newgrad = torch.zeros_like(trainable_tensor)
+    newgrad = [torch.zeros_like(v) for v in trainable_tensor]
     
     net.eval()
 
@@ -613,10 +609,15 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     #         p_buffer[layer_id] = [candidate_p[i].reshape(v.shape) for i in sorted_indices[:args.epochs * batch_num]]  
     #     layer_id += 1
     
-    with torch.no_grad():
-        for epoch in range(args.epochs):
-
     #执行前向传播
+    with torch.no_grad():
+        loss_trajectory = []
+        for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+            x, labels = x.to(args.device), labels.to(args.device)
+            y = net(x)
+            pred = y['logits']
+            loss_trajectory += [F.cross_entropy(pred, labels)]
+        for epoch in range(args.epochs):
             for batch_idx, (x,labels,_) in enumerate(train_dataloader):
                 x, labels = x.to(args.device), labels.to(args.device)
                 labels = labels.long()
@@ -625,31 +626,32 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
                 if p_buffer != {}:
                     p_params = p_buffer[batch_idx + epoch*batch_num].to(device) * args.h
                 else:
-                    p_params = torch.randn_like(trainable_tensor) * args.h
-                loss, jvp = computejvp(net, p_params, trainable_tensor, trainable_struct, x, labels, args)
+                    p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
+                loss, jvp = computejvp(net, p_params, trainable_para, trainable_struct, x, labels, args, loss_trajectory[batch_idx])
 
-                newgrad.add_(jvp*p_params)
-                # for i, fwdgrad in enumerate(newgrad):
-                #     newgrad[i].add_(jvp*p_params[i])
+                # newgrad.add_(jvp*p_params)
+                for i, fwdgrad in enumerate(p_params.values()):
+                    newgrad[i].add_(jvp*fwdgrad)
                 #     if i == args.check_layer_id:
                 #         grad_for_var_check_list.append(jvp*p_params[i])
                 
-                current_loss = loss
+                # current_loss = loss
                 # log
                 # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s, jvp = %s" % (epoch, batch_idx, len(train_dataloader), current_loss, jvp))
 
                 # global_step += 1
 
-    # for i, fwdgrad in enumerate(newgrad):
-    #     newgrad[i] /= (args.epochs * batch_num)
+    for i, fwdgrad in enumerate(newgrad):
+        newgrad[i].div_(args.epochs * batch_num)
+    # newgrad /= (args.epochs * batch_num)
     # break
         #fwdgrad方差阈值判定
         # var = computevar(grad_for_var_check_list)
         # if var <= args.var_threshold:
         #     print(f"Already satisfied the var threshold! Current num of fwdgrad: {len(grad_for_var_check_list)}, var: {var}")
         #     break
-    
-    return newgrad / (args.epochs * batch_num)
+    net.load_state_dict(trainable_para, strict=False)
+    return newgrad
 
 def train_local_bp(net, args, param_dict):
     train_dataloader = param_dict['train_dataloader']
