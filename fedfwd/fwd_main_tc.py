@@ -145,8 +145,8 @@ results_dict = defaultdict(list)
 
 # 用于维护合格的前向梯度
 global_grad = None
-total_data_points = sum([len(net_dataidx_map_train[r]) for r in range(args.n_parties)])
-fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in range(args.n_parties)]
+total_data_points = sum([len(data_loader_dict[r]['train_dl_local']) for r in range(args.n_parties)])
+fed_avg_freqs = [len(data_loader_dict[r]['train_dl_local']) / total_data_points for r in range(args.n_parties)]
 client_first_grad = None
 
 ratio = 1
