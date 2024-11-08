@@ -179,8 +179,32 @@ def compute_accuracy_simple_our(model, dataloader, get_confusion_matrix=False, a
     return correct/float(total)
 
 #def back_to_train(net, clt_id)
+def fedsgd_aggregation_fwd_param(net, clients_para, fed_avg_freqs, args, fwdgrad_pool):
+    avg_global_para = {}
 
-def fedavg_aggregation_fwd(net, global_para, fed_avg_freqs, args, fwdgrad_pool):
+    for client_id in range(args.n_parties):
+        net.load_state_dict(clients_para[client_id],strict = False)
+        optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad  and  ('head' in k or 'adapter' in  k )], lr=0.01)
+        optimizer.zero_grad()
+        trainable_params = [p for p in net.parameters() if p.requires_grad]
+
+        for param, layer_grad in zip(trainable_params, fwdgrad_pool[client_id]):
+            param.grad = layer_grad
+        
+        optimizer.step()
+        optimizer.zero_grad()
+        clients_para[client_id] = {k:copy.deepcopy(v.detach()) for k, v in net.named_parameters() if v.requires_grad}
+
+    # 加权聚合一下参数
+    for k,p in clients_para[0].items():
+        tensor_sample = torch.zeros_like(p)
+        for client_id in range(args.n_parties):
+            tensor_sample += clients_para[client_id][k]*fed_avg_freqs[client_id]
+        avg_global_para[k] = tensor_sample
+    
+    return avg_global_para
+
+def fedsgd_aggregation_fwd_fwdgrad(net, global_para, fed_avg_freqs, args, fwdgrad_pool):
     # 加权聚合fwdgrad
     avg_global_grad = []
     # global_para = {k:v,k:v...}
@@ -385,7 +409,7 @@ def train_local_twostage(net,args,param_dict):
         #     dict_loss["val/test_acc_epoch"] = test_acc    
     return output['embedding_dict']
 
-def computejvp(net, v_params, x, labels, args):
+def computejvp(net, p_params, x, labels, args):
     """
     Calculations Jacobian-vector product using numerical differentiation
     """
@@ -393,8 +417,8 @@ def computejvp(net, v_params, x, labels, args):
     # with autocast():
     criterion = nn.CrossEntropyLoss().to(args.device)
     param = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
-    param1 = {k:param[k]+h*v_params[i] for i, k in enumerate(param)}
-    param2 = {k:param[k]-h*v_params[i] for i, k in enumerate(param)}
+    param1 = {k:param[k]+h*p_params[i] for i, k in enumerate(param)}
+    param2 = {k:param[k]-h*p_params[i] for i, k in enumerate(param)}
 
     net.load_state_dict(param1,strict = False)
     y1 = net(x)
@@ -426,8 +450,42 @@ def computevar(fwdgrad_list):
 
     return var
 
-def train_local_fwd(net, args, param_dict):
+def use_bp_first(net, args, param_dict):
     train_dataloader = param_dict['train_dataloader']
+    device = args.device
+    bp_grad=[]
+    net.train()
+    
+    criterion = nn.CrossEntropyLoss().to(args.device)
+    optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad], lr=0.01)
+
+    for batch_idx, (x, target,_) in enumerate(train_dataloader):
+        x, target = x.to(args.device), target.to(args.device)
+        optimizer.zero_grad()
+        target = target.long()
+        output = net(x)   
+        out = output['logits']
+        loss = criterion(out, target)      
+        loss.backward()
+
+    for v in net.parameters():
+        if v.requires_grad:
+            bp_grad.append(copy.deepcopy(v.grad))
+
+    optimizer.zero_grad()
+    return bp_grad
+
+# def strict_gussian_sample(num,shape,seed):
+#     # 试试每次都用严格服从高斯分布的v
+#     torch.manual_seed(seed)
+#     gaussian_tensors = [torch.normal(0, 1, size=shape) for _ in range(num)]
+#     v_list=[]
+
+#     return v_list
+
+def train_local_fwd_(net, args, param_dict, client_first_grad=None):
+    train_dataloader = param_dict['train_dataloader']
+    round = param_dict['round']
     device = args.device
     trainable_para = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
     trainable_tensor = [copy.deepcopy(v) for k, v in trainable_para.items()]
@@ -440,30 +498,34 @@ def train_local_fwd(net, args, param_dict):
     # global_step = 0
     
     batch_num = len(train_dataloader)
+    print("batch的数量是",batch_num)
+    # perturbation_num = batch_num * 10
+    perturbation_num = batch_num
+    # perturbation_num = 1000
 
-    # grad保存上轮梯度 可以用param_dict['old_grad']传入上轮梯度
-    if param_dict['old_grad'] == None:
-        grad = None
-    else:
-        grad = [copy.deepcopy(g) for g in param_dict['old_grad']]
+    # if args.fwdtrain_param:
+    #     fwdgrad_pool_local = [torch.zeros_like(p) for p in trainable_tensor]
+
+
+
+
+    # # 维护每轮的前向梯度
+    # fwdgrad_pool = {i:[] for i in range(args.n_parties)}
+    # # train完更新下fwdgradpool的参数
+    # for fwdgrad in fwdgrad_list:
+    #     fwdgrad_pool[client_id].append(fwdgrad) 
 
     while True:
         # 生成扰动
         layer_id = 0 
-        v_buffer = {}
+        p_buffer = {}
         var = 0.0
         
         for k,v in trainable_para.items():
-            if grad != None and v.requires_grad:
-                shape = v.shape   # (768,64)
-                candidate_v = torch.randn((batch_num*20,*shape),device="cpu") #(vum*10, 768, 64)
-                target_grad = grad[layer_id] #(768,64)
-                
-                target_grad = torch.flatten(target_grad).unsqueeze(0) #(1,768*64)
-                candidate_v = torch.flatten(candidate_v,start_dim=1) #(vum*10, 768*64)
-                cos_sim = F.cosine_similarity(candidate_v.to(device),target_grad,dim=-1)
-                sorted_values, sorted_indices = torch.sort(cos_sim, descending=True)
-                v_buffer[layer_id] = [candidate_v[i].reshape(v.shape) for i in sorted_indices[:batch_num]]
+            shape = v.shape   # (768,64)
+            # candidate_v = strict_gussian_sample()
+            candidate_p = torch.randn((perturbation_num,*shape),device="cpu") #(vum*10, 768, 64)
+            p_buffer[layer_id] = [p for p in candidate_p]
             layer_id += 1
 
         #执行前向传播
@@ -473,18 +535,96 @@ def train_local_fwd(net, args, param_dict):
                     x, labels = x.to(args.device), labels.to(args.device)
                     labels = labels.long()
 
-                    # 首轮执行时，v_buffer是空的，所以直接高斯采样一个shape相同的tensor
-                    if v_buffer != {}:
-                        v_params = tuple([v_buffer[i][batch_idx].to(device) if p.requires_grad == True else torch.zeros_like(p) for i,p in enumerate(trainable_tensor)])
-                    else:
-                        v_params = tuple([torch.randn_like(p) if p.requires_grad == True else torch.zeros_like(p) for p in trainable_tensor])
+                    p_params = tuple([p_buffer[i][batch_idx].to(device) for i,p in enumerate(trainable_tensor)])
 
-                    loss, jvp = computejvp(net, v_params, x, labels, args)
+                    loss, jvp = computejvp(net, p_params, x, labels, args)
 
                     for i, fwdgrad in enumerate(newgrad):
-                        fwdgrad.add_(jvp*v_params[i])
+                        fwdgrad.add_(jvp*p_params[i])
                         if i == args.check_layer_id:
-                            grad_for_var_check_list.append(jvp*v_params[i])
+                            grad_for_var_check_list.append(jvp*p_params[i])
+                    
+                    current_loss = loss
+                    # log
+                    print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), current_loss))
+
+                    # global_step += 1
+
+        #fwdgrad方差阈值判定
+        var = computevar(grad_for_var_check_list)
+        if var <= args.var_threshold:
+            print(f"Already satisfied the var threshold! Current num of fwdgrad: {len(grad_for_var_check_list)}, var: {var}")
+            break
+    
+    return newgrad
+
+def train_local_fwd(net, args, param_dict, client_first_grad=None):
+    train_dataloader = param_dict['train_dataloader']
+    round = param_dict['round']
+    device = args.device
+    trainable_para = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
+    trainable_tensor = [copy.deepcopy(v) for k, v in trainable_para.items()]
+    # 积累本轮fwdgrad
+    newgrad = [torch.zeros_like(p) for p in trainable_tensor]
+    
+    net.train()
+
+    grad_for_var_check_list = []
+    # global_step = 0
+    
+    batch_num = len(train_dataloader)
+    print("batch的数量是",batch_num)
+    perturbation_num = batch_num * 10
+    # perturbation_num = 100
+
+    if round==0:
+        if args.bpfirst:
+            grad = [copy.deepcopy(g) for g in client_first_grad]
+        else:
+            grad = None
+    else:
+        grad = [copy.deepcopy(g) for g in param_dict['old_grad']]
+
+
+    while True:
+        # 生成扰动
+        layer_id = 0 
+        p_buffer = {}
+        var = 0.0
+        
+        for k,v in trainable_para.items():
+            if grad != None and v.requires_grad:
+                shape = v.shape   # (768,64)
+                # candidate_v = strict_gussian_sample()
+                candidate_p = torch.randn((perturbation_num,*shape),device="cpu") #(vum*10, 768, 64)
+                target_grad = grad[layer_id] #(768,64)
+                
+                target_grad = torch.flatten(target_grad).unsqueeze(0) #(1,768*64)
+                candidate_p = torch.flatten(candidate_p,start_dim=1) #(vum*10, 768*64)
+                cos_sim = F.cosine_similarity(candidate_p.to(device),target_grad,dim=-1)
+                sorted_values, sorted_indices = torch.sort(cos_sim, descending=True)
+                p_buffer[layer_id] = [candidate_p[i].reshape(v.shape) for i in sorted_indices[:batch_num]]  
+            layer_id += 1
+
+        #执行前向传播
+        with torch.no_grad():
+            for epoch in range(args.epochs):
+                for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+                    x, labels = x.to(args.device), labels.to(args.device)
+                    labels = labels.long()
+
+                    # 首轮直接高斯采样
+                    if p_buffer != {}:
+                        p_params = tuple([p_buffer[i][batch_idx].to(device) for i,p in enumerate(trainable_tensor)])
+                    else:
+                        p_params = tuple([torch.randn_like(p) for p in trainable_tensor])
+
+                    loss, jvp = computejvp(net, p_params, x, labels, args)
+
+                    for i, fwdgrad in enumerate(newgrad):
+                        fwdgrad.add_(jvp*p_params[i])
+                        if i == args.check_layer_id:
+                            grad_for_var_check_list.append(jvp*p_params[i])
                     
                     current_loss = loss
                     # log
@@ -520,16 +660,7 @@ def train_local_bp(net, args, param_dict):
             cnt += 1
             print('Training loss is {}'.format(sum(epoch_loss_collector) / len(epoch_loss_collector)))
             epoch_loss_collector = []
-
-    # output = model(inputs) 
-    # loss = criterion(output, targets) 
-    # loss.backward()  # 反向传播，计算梯度
-
-    # for param_group in optimizer.param_groups:
-    #     for param in param_group['params']:
-    #         if param.grad is not None:
-    #             print("Parameter:", param)
-    #             print("Gradient:", param.grad)  # 输出参数的梯度    
+  
     return net
 
 def mkdirs(dirpath):
