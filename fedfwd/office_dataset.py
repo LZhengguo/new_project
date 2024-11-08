@@ -85,19 +85,19 @@ def prepare_data(args):
     webcam_valset = torch.utils.data.Subset(webcam_trainset, list(range(len(webcam_trainset)))[-val_len:]) 
     webcam_trainset = torch.utils.data.Subset(webcam_trainset, list(range(min_data_len)))
 
-    amazon_train_loader = torch.utils.data.DataLoader(amazon_trainset, batch_size=args.batch_size, shuffle=True)
+    amazon_train_loader = torch.utils.data.DataLoader(amazon_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
     amazon_val_loader = torch.utils.data.DataLoader(amazon_valset, batch_size=args.batch_size, shuffle=False)
     amazon_test_loader = torch.utils.data.DataLoader(amazon_testset, batch_size=args.batch_size, shuffle=False)
 
-    caltech_train_loader = torch.utils.data.DataLoader(caltech_trainset, batch_size=args.batch_size, shuffle=True)
+    caltech_train_loader = torch.utils.data.DataLoader(caltech_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
     caltech_val_loader = torch.utils.data.DataLoader(caltech_valset, batch_size=args.batch_size, shuffle=False)
     caltech_test_loader = torch.utils.data.DataLoader(caltech_testset, batch_size=args.batch_size, shuffle=False)
 
-    dslr_train_loader = torch.utils.data.DataLoader(dslr_trainset, batch_size=args.batch_size, shuffle=True)
+    dslr_train_loader = torch.utils.data.DataLoader(dslr_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
     dslr_val_loader = torch.utils.data.DataLoader(dslr_valset, batch_size=args.batch_size, shuffle=False)
     dslr_test_loader = torch.utils.data.DataLoader(dslr_testset, batch_size=args.batch_size, shuffle=False)
 
-    webcam_train_loader = torch.utils.data.DataLoader(webcam_trainset, batch_size=args.batch_size, shuffle=True)
+    webcam_train_loader = torch.utils.data.DataLoader(webcam_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
     webcam_val_loader = torch.utils.data.DataLoader(webcam_valset, batch_size=args.batch_size, shuffle=False)
     webcam_test_loader = torch.utils.data.DataLoader(webcam_testset, batch_size=args.batch_size, shuffle=False)
     

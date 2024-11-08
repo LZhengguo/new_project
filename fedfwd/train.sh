@@ -16,7 +16,7 @@
 python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
           --n_parties 4 --cls_num 10 --device cuda:0 \
          --batch_size 10 --comm_round 70  --test_round 30 --sample 1 --alg SGPT\
-        --dataset office --lr 1 --h 0.1 --epochs 20 \
+        --dataset office --lr 1 --h 0.001 --epochs 10 \
         --peftmode adapter --check_layer_id 20 --fwdtrain_grad --var_threshold 0.1
         #  > logs/train.log
 # --bpfirst

@@ -95,13 +95,8 @@ def compute_accuracy_fwd(global_model,data_loader_dict,args):
 
     return  test_results, test_avg_loss, test_avg_acc, local_mean_acc,local_min_acc
 
+@torch.no_grad()
 def compute_accuracy_loss_our(model, dataloader, device="cpu",prototype = None,args=None):
-    was_training = False
-    if model.training:
-        model.eval()
-        was_training = True
-
-    true_labels_list, pred_labels_list = np.array([]), np.array([])
     criterion = nn.CrossEntropyLoss().to(device)
     model.to(device)
 
@@ -111,27 +106,17 @@ def compute_accuracy_loss_our(model, dataloader, device="cpu",prototype = None,a
         dataloader = [dataloader]
 
     correct, total, total_loss, batch_count = 0, 0, 0, 0
-    with torch.no_grad():
-        for tmp in dataloader:
-            for batch_idx, (x, target) in enumerate(tmp):
-                x, target = x.to(device), target.to(device,dtype=torch.int64)
-                output = model(x)
-                out = output['logits']       
-                _, pred_label = torch.max(out.data, 1)
-                loss = criterion(out, target)
-                correct += (pred_label == target.data).sum().item()
-                total_loss += loss.item()
-                batch_count += 1
-                total += x.data.size()[0]
-                if device == "cpu":
-                    pred_labels_list = np.append(pred_labels_list, pred_label.numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.numpy())
-                else:
-                    pred_labels_list = np.append(pred_labels_list, pred_label.cpu().numpy())
-                    true_labels_list = np.append(true_labels_list, target.data.cpu().numpy())
-
-    if was_training:
-        model.train()
+    for tmp in dataloader:
+        for batch_idx, (x, target) in enumerate(tmp):
+            x, target = x.to(device), target.to(device,dtype=torch.int64)
+            output = model(x)
+            out = output['logits']       
+            _, pred_label = torch.max(out.data, 1)
+            loss = criterion(out, target)
+            correct += (pred_label == target.data).sum().item()
+            total_loss += loss.item()
+            batch_count += 1
+            total += x.data.size()[0]
 
     return correct, total, total_loss/batch_count
 
@@ -232,12 +217,12 @@ def matrix2dict(x, dnn_struct):
 
 def fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, args, fwdgrad_pool):
     # 加权聚合fwdgrad
-    avg_global_grad = []
+    # avg_global_grad = []
     # global_para = {k:v,k:v...}
-    tensor_sample = torch.zeros_like(fwdgrad_pool[0])
-    for client_id in range(args.n_parties):
-        tensor_sample += fwdgrad_pool[client_id] * fed_avg_freqs[client_id]
-    avg_global_grad = matrix2dict(tensor_sample, net_struct)
+    # tensor_sample = torch.zeros_like(fwdgrad_pool[0])
+    # for client_id in range(args.n_parties):
+    #     tensor_sample += fwdgrad_pool[client_id] * fed_avg_freqs[client_id]
+    avg_global_grad = matrix2dict(torch.mean(torch.stack(list(fwdgrad_pool.values())), dim=0), net_struct)
     # 更新global参数
     # 用优化器
     # if current_round < self.warmup_rounds:
@@ -431,28 +416,29 @@ def train_local_twostage(net,args,param_dict):
     return output['embedding_dict']
 
 @torch.no_grad
-def computejvp(net, p_params, x, labels, args):
+def computejvp(net, p_params, trainable_tensor, trainable_struct, x, labels, args):
     """
     Calculations Jacobian-vector product using numerical differentiation
     """
     # with autocast():
     criterion = nn.CrossEntropyLoss().to(args.device)
-    param = {k: v.data.clone() for k, v in net.named_parameters() if v.requires_grad == True}
-    param1 = {k:param[k]+p_params[k] for k in param.keys()}
-    # param2 = {k:param[k] for i, k in enumerate(param)}
+    param = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
+    param1 = matrix2dict(trainable_tensor + p_params, trainable_struct)
 
-    net.load_state_dict(param1,strict = False)
+    for k, v in net.named_parameters():
+        if v.requires_grad == True:
+            v.data = param1[k]
     y1 = net(x)
     pred1 = y1['logits']
     terbulence_loss = criterion(pred1, labels)
 
-    net.load_state_dict(param,strict = False)
+    for k, v in net.named_parameters():
+        if v.requires_grad == True:
+            v.data = param[k]
     y2 = net(x)
     pred2 = y2['logits']
     loss = criterion(pred2,labels)
-    
-    # net.load_state_dict(param,strict = False)
-    
+
     avg_loss = (terbulence_loss + loss)/2
     jvp = (terbulence_loss - loss)/(args.h)
     return avg_loss, jvp
@@ -637,11 +623,10 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
 
                 # 首轮直接高斯采样
                 if p_buffer != {}:
-                    p_params = p_buffer[batch_idx + epoch*batch_num].to(device) * args.h + trainable_tensor
+                    p_params = p_buffer[batch_idx + epoch*batch_num].to(device) * args.h
                 else:
-                    p_params = torch.randn_like(trainable_tensor) * args.h + trainable_tensor
-                p_params_dict = matrix2dict(p_params, trainable_struct)
-                loss, jvp = computejvp(net, p_params_dict, x, labels, args)
+                    p_params = torch.randn_like(trainable_tensor) * args.h
+                loss, jvp = computejvp(net, p_params, trainable_tensor, trainable_struct, x, labels, args)
 
                 newgrad.add_(jvp*p_params)
                 # for i, fwdgrad in enumerate(newgrad):
@@ -651,7 +636,7 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
                 
                 current_loss = loss
                 # log
-                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), current_loss))
+                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s, jvp = %s" % (epoch, batch_idx, len(train_dataloader), current_loss, jvp))
 
                 # global_step += 1
 
