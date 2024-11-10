@@ -202,7 +202,7 @@ class Block(nn.Module):
         self.attn = Attention(config, vis)
 
         if use_adapter == True:
-            self.adapterlayer = AdapterBlock(config.hidden_size,adapter_hidden_dim=64,dropout=0.0)
+            self.adapterlayer = AdapterBlock(config.hidden_size,adapter_hidden_dim=32,dropout=0.0)
     def forward(self, x):
         h = x
         x = self.attention_norm(x)
@@ -264,7 +264,7 @@ class Encoder(nn.Module):
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
         for i in range(config.transformer["num_layers"]):
-            if use_adapter == True and i%6 == 0:
+            if use_adapter == True and i%12 == 0:
                 layer = Block(config, vis, True)
             else:
                 layer = Block(config, vis)
