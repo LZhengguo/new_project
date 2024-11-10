@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument('--root_path', type=str, default='', help='Noise type: None/increasng/space')
     parser.add_argument('--check_layer_id', type=int, default=49)
     parser.add_argument('--var_threshold', type=float, default=0.5)
-    parser.add_argument('--h', type=float, default=0.01, help='learning rate (default: 0.01)')
+    parser.add_argument('-N', '--perturb_num', type=int, default=10, help='num of noise in fwd perturb')
     """
     Used for model 
     """
@@ -153,10 +153,12 @@ ratio = 1
 learning_rate = args.lr * ratio
 optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad  and  ('head' in k or 'adapter' in  k )], lr=learning_rate)
 
+import time
 # 开始fed_learning
 if args.bptrain or args.fwdtrain_grad:
     for round in range(args.comm_round):
         print('########### Now is the round {} ######'.format(round))
+        start = time.time()
         
         # 维护每轮的前向梯度
         fwdgrad_pool = {i:[] for i in range(args.n_parties)}
@@ -167,7 +169,7 @@ if args.bptrain or args.fwdtrain_grad:
             
             # 每轮每个client开始先接收global参数
             # clients_para[client_id] = {k: v.data.clone() for k, v in global_para.items()}
-            # net.load_state_dict(global_para,strict = False)
+            net.load_state_dict(global_para,strict = False)
             
             # data_loader_dict = {0:{'train_dl_local':amazon_train_loader}, 1:{'train_dl_local':caltech_train_loader}, ...}
             train_dl_local = data_loader_dict[client_id]['train_dl_local']
@@ -184,19 +186,20 @@ if args.bptrain or args.fwdtrain_grad:
 
                 param_dict['old_grad'] = global_grad
 
-                fwdgrad_pool[client_id] = train_local_fwd(net, args, param_dict, client_first_grad)
+                clients_para[client_id] = train_local_fwd(net, args, param_dict, client_first_grad)
             else:
                 net = train_local_bp(net, args, param_dict)
                 # 保存client参数
                 clients_para[client_id] = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
             
 
-        if args.fwdtrain_grad:
-            global_grad = fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, args, fwdgrad_pool)
-            # global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
-        else:
-            global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
-            net.load_state_dict(global_para,strict = False)
+        # if args.fwdtrain_grad:
+        #     global_grad = fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, args, fwdgrad_pool)
+        #     # global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
+        # else:
+        print(f"Client training time = {time.time()-start:.2f}s")
+        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
+        net.load_state_dict(global_para,strict = False)
             # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
 
         # net.load_state_dict(global_para,strict = False)
