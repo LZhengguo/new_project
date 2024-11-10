@@ -12,16 +12,35 @@
 #         --dataset cifar100 --lr 0.01 --epochs 5 --key_prompt 20 --avg_key\
 #         --share_blocks 0 1 2 3 4 --share_blocks_g  5 6 
 
-# fwd test
+### fwd aggregate fwdgrad
 python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
-          --n_parties 4 --cls_num 10 --device cuda:3 \
-         --batch_size 5 --comm_round 70  --test_round 30 --sample 1 --alg SGPT\
-        --dataset office --lr 0.01 --epochs 1 \
-        --peftmode adapter --check_layer_id 20 --fwdtrain_param --var_threshold 0.1 > logs/train.log
-# --bpfirst
+        --n_parties 4 --cls_num 10 --device cuda:3 \
+        --comm_round 40  --test_round 30 --sample 1 \
+        --dataset office --lr 0.001 --epochs 1 --batch_size 10\
+        --check_layer_id 2 --var_threshold 0.1  --k 5 --perturb_num 20\
+        --fwdtrain_grad \
+        --peftmode adapter
+#         --peftmode prompt_tuning 
+#         --peftmode adapter 
+#         --peftmode lora
+#         --peftmode bitfit
+### fwd aggregate params
+# python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
+#         --n_parties 4 --cls_num 10 --device cuda:3 \
+#         --comm_round 40  --test_round 30 --sample 1 \
+#         --dataset office --lr 1 --epochs 10 --batch_size 10\
+#         --check_layer_id 2 --var_threshold 0.1  --k 5 \
+#         --fwdtrain_param \
+#         --peftmode adapter
+        # --peftmode prompt_tuning 
+        # --peftmode adapter 
+        # --peftmode lora
+        # --peftmode bitfit
+        # --bpfirst
 
+### bp test
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
 #           --n_parties 4 --cls_num 10 --device cuda:3 \
-#          --batch_size 50 --comm_round 40  --test_round 30 --sample 1 --alg SGPT\
-#         --dataset office --lr 0.01 --epochs 5 \
-#         --peftmode adapter
+#          --batch_size 10 --comm_round 70  --test_round 30 --sample 1 \
+#         --dataset office --lr 0.01 --epochs 10\
+#         --peftmode adapter --check_layer_id 20 --bptrain --var_threshold 0.1 

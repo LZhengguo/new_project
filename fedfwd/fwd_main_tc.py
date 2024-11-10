@@ -15,6 +15,16 @@ from domainnet_dataset import prepare_data_domain
 from utils import *
 import argparse
 from models.vit_models_fwd import *
+import time
+
+import logging
+
+# logging.basicConfig(
+#     filename='logs/train.log',
+#     level=print,     
+#     format='%(asctime)s - %(levelname)s - %(message)s',
+#     datefmt='%Y-%m-%d %H:%M:%S'
+# )
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -25,7 +35,6 @@ def get_args():
     parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
     parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=10,  help='number of workers in a distributed cluster')
-    parser.add_argument('--alg', type=str, default='SGPT',  help='strategy')
     parser.add_argument('--comm_round', type=int, default=60, help='number of maximum communication roun')
     parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
     parser.add_argument('--datadir', type=str, required=False, default="./data/", help="Data directory")
@@ -41,6 +50,8 @@ def get_args():
     parser.add_argument('--root_path', type=str, default='', help='Noise type: None/increasng/space')
     parser.add_argument('--check_layer_id', type=int, default=49)
     parser.add_argument('--var_threshold', type=float, default=0.5)
+    parser.add_argument('--k', type=int, default=5, help="per k layer apply one adpater or lora block")
+    parser.add_argument('--perturb_num', type=int, default=10, help='num of noise in fwd perturb')
     """
     Used for model 
     """
@@ -53,10 +64,14 @@ def get_args():
     parser.add_argument('--bptrain',action='store_true')
     parser.add_argument('--peftmode', type=str, help='set peft mode in (adapter、lora、bitfit)')
     parser.add_argument('--bpfirst',action='store_true')
+    parser.add_argument('--lora_alpha',type=float,default=1)
+    parser.add_argument('--lora_rank',type=int,default=4)
+    parser.add_argument('--n_prompt',type=int,default=1)
     
     args = parser.parse_args()
     return args
 args = get_args()
+
 if args.dataset == 'CIFAR-100':
     cls_coarse = \
             np.array([
@@ -71,7 +86,7 @@ if args.dataset == 'CIFAR-100':
                 16, 19, 2, 4, 6, 19, 5, 5, 8, 19,
                 18, 1, 2, 15, 6, 0, 17, 8, 14, 13
             ])
-# args=Args()
+    
 save_path = args.model_type+"-"+str(args.n_parties)+"-"+args.dataset+'-'+str(args.cls_num)+"-"+args.partition
 root_path = args.logdir
 
@@ -86,12 +101,10 @@ print(save_path)
 with open(os.path.join(save_path,'commandline_args.txt'), 'w') as f:
     json.dump(args.__dict__, f, indent=2)
 
+### dataloder init
 if args.dataset not in ['office','domainnet']:
     X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts, testdata_cls_counts = partition_data(
                 args.dataset, args.datadir, args.partition, args.n_parties, beta=args.beta, logdir=args.logdir,args=args)
-
-# arr = [0,1,2,3]
-arr = np.arange(args.n_parties)
 
 if args.dataset == 'office':
     data_loader_dict,net_dataidx_map_train = prepare_data(args)
@@ -102,7 +115,7 @@ elif args.dataset == 'domainnet':
 else:
     ###### Data Set related ###### 
     data_loader_dict = {}
-    for net_id in arr:
+    for net_id in range(args.n_parties):
         dataidxs_train = net_dataidx_map_train[net_id]
         dataidxs_test = net_dataidx_map_test[net_id]
         data_loader_dict[net_id] = {}
@@ -110,96 +123,83 @@ else:
         num_classes = 100
         data_loader_dict[net_id]['train_dl_local'] = train_dl_local
         data_loader_dict[net_id]['test_dl_local'] = test_dl_local
-            
-np.random.seed(seed)
-torch.manual_seed(seed)
-random.seed(seed)
 
 device = args.device
-###### Model related ###### 
 config = CONFIGS[args.model_type]
 
+### model init
 net = VisionTransformerForward(config, args.img_size, num_classes=num_classes,vis = True,args= args)
 net.load_from(np.load(args.pretrained_dir))
-
 net.freeze()
 net.to(device)
 
-global_para = {k: copy.deepcopy(v) for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
-# trainable_para = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
-# all_para = {k: copy.deepcopy(v) for k, v in net.named_parameters()}
-# trainable_cnt = len(trainable_para)
-# all_cnt = len(all_para)
-# print(trainable_cnt)
-# print(all_cnt)
+### params extract
+global_para = {k:v.detach().clone() for k, v in net.named_parameters() if v.requires_grad == True}
+# for k in global_para.keys():
+#     print(k)
+clients_para = {}  # client_para = {0:{k:v, k:v, ...}, 1:{k:v, k:v, ...}, ...} 
+for net_id in range(args.n_parties):
+    clients_para[net_id] = {k:v.clone() for k, v in global_para.items()}
 
-
-clients_para = {}
-# client_para = {0:{k:v, k:v, ...}, 1:{k:v, k:v, ...}, ...} 
-for net_id in arr:
-    clients_para[net_id] = {k:copy.deepcopy(v) for k, v in global_para.items()}
-
+### loss save
 dict_loss = {}
 results_dict = defaultdict(list)
 
-# 用于维护合格的前向梯度
+### grad
 global_grad = None
+client_first_grad = None
 
+### avg frequency
 total_data_points = sum([len(net_dataidx_map_train[r]) for r in range(args.n_parties)])
 fed_avg_freqs = [len(net_dataidx_map_train[r]) / total_data_points for r in range(args.n_parties)]
 
-client_first_grad = None
+start_time = time.time()
 
-# 开始fed_learning
+### start fed_learning
 if args.bptrain or args.fwdtrain_grad:
     for round in range(args.comm_round):
         print('########### Now is the round {} ######'.format(round))
         
-        # 维护每轮的前向梯度
-        fwdgrad_pool = {i:[] for i in range(args.n_parties)}
+        # forward grad pool init
+        # fwdgrad_pool = {i:[] for i in range(args.n_parties)}
 
         for client_id in range(args.n_parties):
-            param_dict = {}
             print('Now is the client {}'.format(client_id))
-            
-            # 每轮每个client开始先接收global参数
-            clients_para[client_id] = {k:copy.deepcopy(v) for k, v in global_para.items()}
-            net.load_state_dict(clients_para[client_id],strict = False)
-            
-            # data_loader_dict = {0:{'train_dl_local':amazon_train_loader}, 1:{'train_dl_local':caltech_train_loader}, ...}
-            train_dl_local = data_loader_dict[client_id]['train_dl_local']
-            # test_dl_local = data_loader_dict[client_id]['test_dl_local'] 
 
+            if args.bptrain:
+                clients_para[client_id] = {k:copy.deepcopy(v) for k, v in global_para.items()}
+                net.load_state_dict(clients_para[client_id], strict=False)
+            elif args.fwdtrain_grad:
+                net.load_state_dict(global_para,strict=False)
+
+            train_dl_local = data_loader_dict[client_id]['train_dl_local']
+            param_dict = {}
             param_dict['train_dataloader'] = train_dl_local
             param_dict['round'] = round
+            
             # train!
             if args.fwdtrain_grad:
-                # 要不试下首轮用真梯度给方向 不妨先在client上算 验证想法
+                # 要不试下首轮用真梯度给方向
                 if round==0 and args.bpfirst:
                     client_first_grad = use_bp_first(net, args, param_dict)
 
-                param_dict['old_grad'] = global_grad
-
-                fwdgrad_list = train_local_fwd(net, args, param_dict, client_first_grad)
-                # train完更新下fwdgradpool的参数
-                for fwdgrad in fwdgrad_list:
-                    fwdgrad_pool[client_id].append(fwdgrad) 
+                clients_para[client_id] = train_local_fwd(net, args, param_dict, client_first_grad)
             else:
                 net = train_local_bp(net, args, param_dict)
-                # 保存client参数
                 clients_para[client_id] = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
-            
 
-        if args.fwdtrain_grad:
-            global_grad = fedsgd_aggregation_fwd_fwdgrad(net, global_para, fed_avg_freqs, args, fwdgrad_pool)
-            global_para = {k: copy.deepcopy(v) for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
-        else:
-            global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
-            # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
-
-        # net.load_state_dict(global_para,strict = False)
-    
+        # if args.fwdtrain_grad:
+        #     global_grad = fedsgd_aggregation_fwd_fwdgrad(net, global_para, fed_avg_freqs, args, fwdgrad_pool, round)
+        #     # global_para = {k: copy.deepcopy(v) for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
+        # else:
+        #     global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
+        client_totaltime = time.time()
+        print(f'>> round {round} client total training time custom:{client_totaltime - start_time}') 
+        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
+        net.load_state_dict(global_para,strict = False)
         # evaluate一下
+        end_time = time.time()
+        print(f'>> round {round} total time custom:{end_time - start_time}') 
         test_results, test_avg_loss, test_avg_acc, local_mean_acc,local_min_acc = compute_accuracy_fwd(net, data_loader_dict, args)
         print('>> Mean Local Test accuracy: %f' % local_mean_acc)
         print('>> Min Local Test accuracy: %f' % local_min_acc)
@@ -211,15 +211,16 @@ if args.bptrain or args.fwdtrain_grad:
         results_dict['local_mean_acc'].append(local_mean_acc)
         results_dict['local_min_acc'].append(local_min_acc)
         
+        # for save
         # if (round+1)>=args.test_round:
         #     outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
         #     torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
 elif args.fwdtrain_param:
     for round in range(args.comm_round):
         print('########### Now is the round {} ######'.format(round))
-        
         # 维护每轮的前向梯度
         fwdgrad_pool = {i:[] for i in range(args.n_parties)}
+        train_num_dict = {i:0 for i in range(args.n_parties)}
 
         for client_id in range(args.n_parties):
             param_dict = {}
@@ -241,19 +242,22 @@ elif args.fwdtrain_param:
             if round==0 and args.bpfirst:
                 client_first_grad = use_bp_first(net, args, param_dict)
 
-            fwdgrad_list = train_local_fwd_(net, args, param_dict, client_first_grad)
+            fwdgrad_list, train_num = train_local_fwd_(net, args, param_dict, client_first_grad)
             # train完更新下fwdgradpool的参数
+            # print(f"前向梯度是{fwdgrad_list[49]}")
             for fwdgrad in fwdgrad_list:
                 fwdgrad_pool[client_id].append(fwdgrad) 
-
+            train_num_dict[client_id] = train_num
+        
+        # print(f"fwdgrad 是{fwdgrad_pool[0][49]}")
             
-        global_para = fedsgd_aggregation_fwd_param(net, clients_para, fed_avg_freqs, args, fwdgrad_pool)
-        # global_para = {k: copy.deepcopy(v) for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
-        # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
-
-        # net.load_state_dict(global_para,strict = False)
+        global_para = fedsgd_aggregation_fwd_param(net, global_para, clients_para, fed_avg_freqs, args, fwdgrad_pool,train_num_dict)
+        
     
         # evaluate一下
+        end_time = time.time()
+        print(f'>> round {round} time custom:{end_time - start_time}') 
+
         test_results, test_avg_loss, test_avg_acc, local_mean_acc,local_min_acc = compute_accuracy_fwd(net, data_loader_dict, args)
         print('>> Mean Local Test accuracy: %f' % local_mean_acc)
         print('>> Min Local Test accuracy: %f' % local_min_acc)
@@ -265,6 +269,7 @@ elif args.fwdtrain_param:
         results_dict['local_mean_acc'].append(local_mean_acc)
         results_dict['local_min_acc'].append(local_min_acc)
         
+        # for save
         # if (round+1)>=args.test_round:
         #     outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
         #     torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
