@@ -267,3 +267,27 @@ def download_and_extract_archive(
     archive = os.path.join(download_root, filename)
     print("Extracting {} to {}".format(archive, extract_root))
     extract_archive(archive, extract_root, remove_finished)
+
+import torchvision.transforms.v2 as transforms
+class CIFAR100Resize(Dataset):
+    def __init__(self, imgs, img_labels):
+        self.imgs = imgs
+        self.img_labels = img_labels
+        self.transform = torch.jit.script(transforms.Resize([224, 224]))
+
+    def __len__(self):
+        return len(self.img_labels)
+
+    def __getitem__(self, idx):
+        label = self.img_labels[idx]
+        image = self.transform(self.imgs[idx])
+        return image, label
+def read_client_data(dataset, idx, split='train'):
+    data_dir = os.path.join('data', dataset, f'{split}/')
+    file = data_dir + str(idx) + '.npz'
+    with open(file, 'rb') as f:
+        data = np.load(f, allow_pickle=True)['data'].tolist()
+    X = torch.Tensor(data['x']).type(torch.float32)
+    y = torch.Tensor(data['y']).type(torch.int64)
+    resized_dataset = CIFAR100Resize(X,y)
+    return resized_dataset

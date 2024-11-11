@@ -2,7 +2,7 @@ import os
 import logging
 import numpy as np
 import torch
-import torchvision.transforms as transforms
+import torchvision.transforms.v2 as transforms
 import torch.utils.data as data
 import random
 import copy
@@ -18,6 +18,7 @@ import torch.optim as optim
 import torch, torch.nn as nn, torch.nn.functional as F
 import math
 from torch.cuda.amp import autocast
+import tqdm
 # from pypapi import events, papi_high as high
 
 logging.basicConfig()
@@ -246,12 +247,10 @@ def fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, ar
 
     return avg_global_grad
 
-def fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args):
+def fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients):
     avg_global_para = {}
     for k,v in global_para.items():
-        v.data = torch.zeros_like(v)
-        for client_id in range(args.n_parties):
-            v.data += clients_para[client_id][k]*fed_avg_freqs[client_id]
+        v.data = torch.stack([clients_para[client_id][k] for client_id in selected_clients]).mean()
     return avg_global_para
 
 
@@ -427,7 +426,7 @@ def computejvp(net, p_params, trainable_params, trainable_struct, x, labels, h, 
 
     # net.load_state_dict(param1, strict=False)
     for k, v in net.named_parameters():
-        if v.requires_grad == True:
+        if k in trainable_params:
             v.data = trainable_params[k] + p_params[k] * h
     y1 = net(x)
     pred1 = y1['logits']
@@ -558,20 +557,44 @@ def train_local_fwd_(net, args, param_dict, client_first_grad=None):
             break
     
     return newgrad
+def pit(it, *pargs, **nargs):
+    import enlighten
+    global __pit_man__
+    try:
+        __pit_man__
+    except NameError:
+        __pit_man__ = enlighten.get_manager()
+    man = __pit_man__
+    try:
+        it_len = len(it)
+    except:
+        it_len = None
+    try:
+        ctr = None
+        for i, e in enumerate(it):
+            if i == 0:
+                ctr = man.counter(*pargs, **{**dict(leave = False, total = it_len), **nargs})
+            yield e
+            ctr.update()
+    finally:
+        if ctr is not None:
+            ctr.close()
 
+@torch.no_grad()
+@torch.compile()
 def train_local_fwd(net, args, param_dict, client_first_grad=None):
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
-    trainable_para = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
+    trainable_para = {k: v for k, v in net.named_parameters() if v.requires_grad == True}
     trainable_struct = dict([(k, v.shape) for k, v in trainable_para.items()])
     # trainable_tensor = dict2matrix(trainable_para)
     trainable_tensor = trainable_para.values()
     
     for p in trainable_tensor:
         p.grad = torch.zeros_like(p.data)
+        # p.requires_grad = False
     # 积累本轮fwdgrad
-    
     net.eval()
 
     grad_for_var_check_list = []
@@ -610,45 +633,50 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     #         p_buffer[layer_id] = [candidate_p[i].reshape(v.shape) for i in sorted_indices[:args.epochs * batch_num]]  
     #     layer_id += 1
     #执行前向传播
-    optimizer = torch.optim.SGD(trainable_tensor, lr=1.0)
-    with torch.no_grad():
+    # head = [v for k,v in net.named_parameters() if v.requires_grad == True]
+    # head_optimizer = torch.optim.SGD(head, lr=1.0)
+    optimizer = torch.optim.SGD(trainable_tensor, lr=0.1)
         # loss_trajectory = []
         # for batch_idx, (x,labels,_) in enumerate(train_dataloader):
         #     x, labels = x.to(args.device), labels.to(args.device)
         #     y = net(x)
         #     pred = y['logits']
         #     loss_trajectory += [F.cross_entropy(pred, labels)]
-        for epoch in range(args.epochs):
-            for batch_idx, (x,labels,_) in enumerate(train_dataloader):
-                x, labels = x.to(args.device), labels.to(args.device)
-                labels = labels.long()
-                y = net(x)
-                pred = y['logits']
-                loss = F.cross_entropy(pred, labels)
-                jvp_list = []
-                for i in range(args.perturb_num):
-                    p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
-                    terbulence_loss, jvp = computejvp(net, p_params, trainable_para, trainable_struct, x, labels, args.lr, loss)
-                    jvp_list += [jvp]
-                    # newgrad.add_(jvp*p_params)
-                    for p, fwdgrad in zip(trainable_tensor, p_params.values()):
-                        p.grad.data.add_(jvp*fwdgrad)
-                #     if i == args.check_layer_id:
-                #         grad_for_var_check_list.append(jvp*p_params[i])
-                # print("jvp var:", torch.stack(jvp_list).var().item())
-                for k, v in net.named_parameters():
-                    if v.requires_grad == True:
-                        v.data = trainable_para[k]
-                torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=False)
-                
-                
-                # current_loss = loss
-                # log
-                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s, jvp = %s" % (epoch, batch_idx, len(train_dataloader), current_loss, jvp))
+    for epoch in range(args.epochs):
+        for x,labels in pit(train_dataloader, color = 'blue'):
+            x, labels = x.to(args.device), labels.to(args.device)
+            labels = labels.long()
+            y = net(x)
+            pred = y['logits']
+            loss = F.cross_entropy(pred, labels)
+            # loss.backward()
+            # y = net(x)
+            # pred = y['logits']
+            # loss = F.cross_entropy(pred, labels)
+            for i in range(args.perturb_num):
+                p_params = {k: torch.randn_like(v) for k, v in trainable_para.items()}
+                terbulence_loss, jvp = computejvp(net, p_params, trainable_para, trainable_struct, x, labels, args.lr, loss)
+                # newgrad.add_(jvp*p_params)
+                for p, fwdgrad in zip(trainable_tensor, p_params.values()):
+                    p.grad.data.add_(fwdgrad.mul_(jvp))
+            #     if i == args.check_layer_id:
+            #         grad_for_var_check_list.append(jvp*p_params[i])
+            for k, v in net.named_parameters():
+                if k in trainable_para:
+                    v.data = trainable_para[k]
+            torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=False)
+            # torch.nn.utils.clip_grad_norm_(head, 1.0)
+            # head_optimizer.step()
+            # head_optimizer.zero_grad()
+            
+            
+            # current_loss = loss
+            # log
+            # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s, jvp = %s" % (epoch, batch_idx, len(train_dataloader), current_loss, jvp))
 
-                # global_step += 1
+            # global_step += 1
 
     # newgrad /= (args.epochs * batch_num)
     # break
@@ -657,7 +685,9 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
         # if var <= args.var_threshold:
         #     print(f"Already satisfied the var threshold! Current num of fwdgrad: {len(grad_for_var_check_list)}, var: {var}")
         #     break
-    return trainable_para
+    # for p in trainable_tensor:
+    #     p.requires_grad = True
+    return {k:v for k, v in net.named_parameters() if v.requires_grad == True}
 
 def train_local_bp(net, args, param_dict):
     train_dataloader = param_dict['train_dataloader']
@@ -666,7 +696,7 @@ def train_local_bp(net, args, param_dict):
     cnt = 0
     for epoch in range(args.epochs):
         epoch_loss_collector = []
-        for batch_idx, (x, target,_) in enumerate(train_dataloader):
+        for x, target in train_dataloader:
             x, target = x.to(args.device), target.to(args.device)
             optimizer.zero_grad()
             target = target.long()
@@ -993,42 +1023,27 @@ def get_divided_dataloader(args, dataidxs_train, dataidxs_test,noise_level=0, dr
         dl_obj = CIFAR100_truncated
         if apply_noise:
             transform_train = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((args.img_size, args.img_size)),
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
+                transforms.Resize((args.img_size, args.img_size)),
+                torch.compile(transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762))),
                 GaussianNoise(0., noise_level)
             ])
-            # data prep for test set
-            transform_test = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((args.img_size, args.img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762)),
-                GaussianNoise(0., noise_level)
-                ])
         else:
             transform_train = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.Resize((args.img_size, args.img_size)),
                 transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762))])
-
-            transform_test = transforms.Compose([
-                transforms.ToPILImage(),
                 transforms.Resize((args.img_size, args.img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762))])
+                transforms.Normalize((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762))
+            ])
     traindata_cls_counts = traindata_cls_counts
-    train_ds = dl_obj(datadir, dataidxs=dataidxs_train, train=True, transform=transform_train, download=False,return_index=True)
-    test_ds = dl_obj(datadir, dataidxs= dataidxs_test ,train=False, transform=transform_test, download=False,return_index=False)
+    train_ds = dl_obj(datadir, dataidxs=dataidxs_train, train=True, transform=transform_train, download=False,return_index=False)
+    test_ds = dl_obj(datadir, dataidxs=dataidxs_test ,train=False, transform=transform_train, download=False,return_index=False)
 
     conditioned_loader = {}
-    if traindata_cls_counts is not None:
-        for cls_id in traindata_cls_counts.keys():
-            cnd_ds =  dl_obj(datadir, dataidxs=dataidxs_train, train=True, transform=transform_train, download=False,cls_condition= cls_id)
-            train_dl = data.DataLoader(dataset=cnd_ds, batch_size=train_bs, shuffle=True, drop_last=drop_last)
-            conditioned_loader[cls_id]  = train_dl
+    # if traindata_cls_counts is not None:
+    #     for cls_id in traindata_cls_counts.keys():
+    #         cnd_ds =  dl_obj(datadir, dataidxs=dataidxs_train, train=True, transform=transform_train, download=False,cls_condition=cls_id)
+    #         train_dl = data.DataLoader(dataset=cnd_ds, batch_size=train_bs, shuffle=True, drop_last=drop_last)
+    #         conditioned_loader[cls_id]  = train_dl
 
 
     train_dl = data.DataLoader(dataset=train_ds, batch_size=train_bs, shuffle=True, drop_last=drop_last)

@@ -8,7 +8,7 @@ import os
 
 
 class OfficeDataset(Dataset):
-    def __init__(self, base_path, site, train=True, transform=None,retrun_index =False):
+    def __init__(self, base_path, site, train=True, transform=None, retrun_index=False):
         if train:
             self.paths, self.text_labels = np.load('data/office_caltech_10/{}_train.pkl'.format(site), allow_pickle=True)
         else:
@@ -56,16 +56,16 @@ def prepare_data(args):
     ])
     
     # amazon
-    amazon_trainset = OfficeDataset(data_base_path, 'amazon', transform=transform_office,retrun_index=True)
+    amazon_trainset = OfficeDataset(data_base_path, 'amazon', transform=transform_office)
     amazon_testset = OfficeDataset(data_base_path, 'amazon', transform=transform_test, train=False)
     # caltech
-    caltech_trainset = OfficeDataset(data_base_path, 'caltech', transform=transform_office,retrun_index=True)
+    caltech_trainset = OfficeDataset(data_base_path, 'caltech', transform=transform_office)
     caltech_testset = OfficeDataset(data_base_path, 'caltech', transform=transform_test, train=False)
     # dslr
-    dslr_trainset = OfficeDataset(data_base_path, 'dslr', transform=transform_office,retrun_index=True)
+    dslr_trainset = OfficeDataset(data_base_path, 'dslr', transform=transform_office)
     dslr_testset = OfficeDataset(data_base_path, 'dslr', transform=transform_test, train=False)
     # webcam
-    webcam_trainset = OfficeDataset(data_base_path, 'webcam', transform=transform_office,retrun_index=True)
+    webcam_trainset = OfficeDataset(data_base_path, 'webcam', transform=transform_office)
     webcam_testset = OfficeDataset(data_base_path, 'webcam', transform=transform_test, train=False)
 
     min_data_len = min(len(amazon_trainset), len(caltech_trainset), len(dslr_trainset), len(webcam_trainset))
@@ -85,19 +85,19 @@ def prepare_data(args):
     webcam_valset = torch.utils.data.Subset(webcam_trainset, list(range(len(webcam_trainset)))[-val_len:]) 
     webcam_trainset = torch.utils.data.Subset(webcam_trainset, list(range(min_data_len)))
 
-    amazon_train_loader = torch.utils.data.DataLoader(amazon_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
+    amazon_train_loader = torch.utils.data.DataLoader(amazon_trainset, batch_size=args.batch_size, drop_last=True, shuffle=True)
     amazon_val_loader = torch.utils.data.DataLoader(amazon_valset, batch_size=args.batch_size, shuffle=False)
     amazon_test_loader = torch.utils.data.DataLoader(amazon_testset, batch_size=args.batch_size, shuffle=False)
 
-    caltech_train_loader = torch.utils.data.DataLoader(caltech_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
+    caltech_train_loader = torch.utils.data.DataLoader(caltech_trainset, batch_size=args.batch_size, drop_last=True, shuffle=True)
     caltech_val_loader = torch.utils.data.DataLoader(caltech_valset, batch_size=args.batch_size, shuffle=False)
     caltech_test_loader = torch.utils.data.DataLoader(caltech_testset, batch_size=args.batch_size, shuffle=False)
 
-    dslr_train_loader = torch.utils.data.DataLoader(dslr_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
+    dslr_train_loader = torch.utils.data.DataLoader(dslr_trainset, batch_size=args.batch_size, drop_last=True, shuffle=True)
     dslr_val_loader = torch.utils.data.DataLoader(dslr_valset, batch_size=args.batch_size, shuffle=False)
     dslr_test_loader = torch.utils.data.DataLoader(dslr_testset, batch_size=args.batch_size, shuffle=False)
 
-    webcam_train_loader = torch.utils.data.DataLoader(webcam_trainset, batch_size=args.batch_size, drop_last=True, shuffle=False)
+    webcam_train_loader = torch.utils.data.DataLoader(webcam_trainset, batch_size=args.batch_size, drop_last=True, shuffle=True)
     webcam_val_loader = torch.utils.data.DataLoader(webcam_valset, batch_size=args.batch_size, shuffle=False)
     webcam_test_loader = torch.utils.data.DataLoader(webcam_testset, batch_size=args.batch_size, shuffle=False)
     

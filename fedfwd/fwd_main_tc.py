@@ -14,6 +14,7 @@ from domainnet_dataset import prepare_data_domain
 from utils import *
 import argparse
 from models.vit_models_fwd import *
+import tqdm
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -86,9 +87,7 @@ print(save_path)
 with open(os.path.join(save_path,'commandline_args.txt'), 'w') as f:
     json.dump(args.__dict__, f, indent=2)
 
-if args.dataset not in ['office','domainnet']:
-    X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts, testdata_cls_counts = partition_data(
-                args.dataset, args.datadir, args.partition, args.n_parties, beta=args.beta, logdir=args.logdir,args=args)
+# if args.dataset not in ['office','domainnet']:
 
 # arr = [0,1,2,3]
 arr = np.arange(args.n_parties)
@@ -101,15 +100,23 @@ elif args.dataset == 'domainnet':
     num_classes = 10
 else:
     ###### Data Set related ###### 
+    num_classes = 100
     data_loader_dict = {}
-    for net_id in arr:
-        dataidxs_train = net_dataidx_map_train[net_id]
-        dataidxs_test = net_dataidx_map_test[net_id]
-        data_loader_dict[net_id] = {}
-        train_dl_local, test_dl_local, _, _ ,_,_ = get_divided_dataloader(args, dataidxs_train, dataidxs_test,traindata_cls_counts=traindata_cls_counts[net_id])
-        num_classes = 100
-        data_loader_dict[net_id]['train_dl_local'] = train_dl_local
-        data_loader_dict[net_id]['test_dl_local'] = test_dl_local
+    X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts, testdata_cls_counts = partition_data(
+        args.dataset, args.datadir, args.partition, args.n_parties, beta=args.beta, logdir=args.logdir,args=args)
+    for client_id in range(args.n_parties):
+        data_loader_dict[client_id] = {}
+        # from datasets import read_client_data
+        # train_data = read_client_data(args.dataset, client_id, 'train')
+        # test_data = read_client_data(args.dataset, client_id, 'test')
+        # data_loader_dict[client_id]['train_dl_local'] = data.DataLoader(dataset=train_data, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        # data_loader_dict[client_id]['test_dl_local'] = data.DataLoader(dataset=test_data, batch_size=256, shuffle=False, drop_last=False)
+        dataidxs_train = net_dataidx_map_train[client_id]
+        dataidxs_test = net_dataidx_map_test[client_id]
+        data_loader_dict[client_id] = {}
+        train_dl_local, test_dl_local, _, _ ,_,_ = get_divided_dataloader(args, dataidxs_train, dataidxs_test,traindata_cls_counts=traindata_cls_counts[client_id])
+        data_loader_dict[client_id]['train_dl_local'] = train_dl_local
+        data_loader_dict[client_id]['test_dl_local'] = test_dl_local
             
 np.random.seed(seed)
 torch.manual_seed(seed)
@@ -124,6 +131,7 @@ net.load_from(np.load(args.pretrained_dir))
 
 net.freeze()
 net.to(device)
+# net = torch.compile(net)
 
 global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
 net_struct = dict([(k, v.shape) for k, v in global_para.items()])
@@ -154,6 +162,8 @@ learning_rate = args.lr * ratio
 optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad  and  ('head' in k or 'adapter' in  k )], lr=learning_rate)
 
 import time
+clients = np.arange(args.n_parties)
+num_sample = int(args.sample * args.n_parties)
 # 开始fed_learning
 if args.bptrain or args.fwdtrain_grad:
     for round in range(args.comm_round):
@@ -161,9 +171,9 @@ if args.bptrain or args.fwdtrain_grad:
         start = time.time()
         
         # 维护每轮的前向梯度
-        fwdgrad_pool = {i:[] for i in range(args.n_parties)}
+        selected_clients = np.random.choice(clients, num_sample)
 
-        for client_id in range(args.n_parties):
+        for client_id in pit(selected_clients, color = 'red'):
             param_dict = {}
             # print('Now is the client {}'.format(client_id))
             
@@ -198,7 +208,7 @@ if args.bptrain or args.fwdtrain_grad:
         #     # global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
         # else:
         print(f"Client training time = {time.time()-start:.2f}s")
-        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, args)
+        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients)
         net.load_state_dict(global_para,strict = False)
             # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
 
