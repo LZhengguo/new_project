@@ -41,6 +41,7 @@ def get_args():
     parser.add_argument('--root_path', type=str, default='', help='Noise type: None/increasng/space')
     parser.add_argument('--check_layer_id', type=int, default=49)
     parser.add_argument('--var_threshold', type=float, default=0.5)
+    parser.add_argument('--h', type=float, default=0.01, help='perturbation rate (default: 0.01)')
     parser.add_argument('-N', '--perturb_num', type=int, default=10, help='num of noise in fwd perturb')
     """
     Used for model 
@@ -102,9 +103,9 @@ else:
     ###### Data Set related ###### 
     num_classes = 100
     data_loader_dict = {}
-    X_train, y_train, X_test, y_test, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts, testdata_cls_counts = partition_data(
+    cifar100_train_ds, cifar100_test_ds, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts, testdata_cls_counts = partition_data(
         args.dataset, args.datadir, args.partition, args.n_parties, beta=args.beta, logdir=args.logdir,args=args)
-    for client_id in range(args.n_parties):
+    for client_id in pit(range(args.n_parties)):
         data_loader_dict[client_id] = {}
         # from datasets import read_client_data
         # train_data = read_client_data(args.dataset, client_id, 'train')
@@ -114,7 +115,10 @@ else:
         dataidxs_train = net_dataidx_map_train[client_id]
         dataidxs_test = net_dataidx_map_test[client_id]
         data_loader_dict[client_id] = {}
-        train_dl_local, test_dl_local, _, _ ,_,_ = get_divided_dataloader(args, dataidxs_train, dataidxs_test,traindata_cls_counts=traindata_cls_counts[client_id])
+        train_ds = data.Subset(cifar100_train_ds, net_dataidx_map_train[client_id])
+        test_ds = data.Subset(cifar100_test_ds, net_dataidx_map_test[client_id])
+        train_dl_local = data.DataLoader(dataset=train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True)
+        test_dl_local = data.DataLoader(dataset=test_ds, batch_size=256, shuffle=False, drop_last=False)
         data_loader_dict[client_id]['train_dl_local'] = train_dl_local
         data_loader_dict[client_id]['test_dl_local'] = test_dl_local
             
@@ -128,6 +132,8 @@ config = CONFIGS[args.model_type]
 
 net = VisionTransformerForward(config, args.img_size, num_classes=num_classes,vis = True,args= args)
 net.load_from(np.load(args.pretrained_dir))
+head_para = torch.load('checkpoints/cifar100_head_tuning.pt')
+net.load_state_dict(head_para, strict=False)
 
 net.freeze()
 net.to(device)
@@ -165,6 +171,8 @@ import time
 clients = np.arange(args.n_parties)
 num_sample = int(args.sample * args.n_parties)
 # 开始fed_learning
+best_acc = 0
+best_round = args.test_round
 if args.bptrain or args.fwdtrain_grad:
     for round in range(args.comm_round):
         print('########### Now is the round {} ######'.format(round))
@@ -200,7 +208,7 @@ if args.bptrain or args.fwdtrain_grad:
             else:
                 net = train_local_bp(net, args, param_dict)
                 # 保存client参数
-                clients_para[client_id] = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
+                clients_para[client_id] = {k: v.data.clone() for k, v in net.named_parameters() if v.requires_grad == True}
             
 
         # if args.fwdtrain_grad:
@@ -208,7 +216,7 @@ if args.bptrain or args.fwdtrain_grad:
         #     # global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
         # else:
         print(f"Client training time = {time.time()-start:.2f}s")
-        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients)
+        fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients)
         net.load_state_dict(global_para,strict = False)
             # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
 
@@ -225,6 +233,14 @@ if args.bptrain or args.fwdtrain_grad:
         results_dict['test_avg_acc'].append(test_avg_acc)
         results_dict['local_mean_acc'].append(local_mean_acc)
         results_dict['local_min_acc'].append(local_min_acc)
+    
+        if (round+1)>=args.test_round:
+            if test_avg_acc >= best_acc:
+                torch.save(global_para,os.patch.join(save_path,'Vit_PEFT.pt'))
+                best_acc = test_avg_acc
+                best_round = round
+            elif round - best_round >= 10:
+                break
         
         # if (round+1)>=args.test_round:
         #     outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
