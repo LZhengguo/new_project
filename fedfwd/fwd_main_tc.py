@@ -236,7 +236,7 @@ if args.bptrain or args.fwdtrain_grad:
     
         if (round+1)>=args.test_round:
             if test_avg_acc >= best_acc:
-                torch.save(global_para,os.patch.join(save_path,'Vit_PEFT.pt'))
+                torch.save(global_para,os.path.join(save_path,'Vit_PEFT.pt'))
                 best_acc = test_avg_acc
                 best_round = round
             elif round - best_round >= 10:
