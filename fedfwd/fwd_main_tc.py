@@ -139,7 +139,7 @@ net.freeze()
 net.to(device)
 # net = torch.compile(net)
 
-global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
+global_para = {k: v.data.clone() for k, v in net.named_parameters() if "head" in k or "adapter" in k}
 net_struct = dict([(k, v.shape) for k, v in global_para.items()])
 # trainable_para = {k: copy.deepcopy(v) for k, v in net.named_parameters() if v.requires_grad == True}
 # all_para = {k: copy.deepcopy(v) for k, v in net.named_parameters()}
@@ -165,7 +165,10 @@ client_first_grad = None
 
 ratio = 1
 learning_rate = args.lr * ratio
-optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad  and  ('head' in k or 'adapter' in  k )], lr=learning_rate)
+fwd_paras = [p for k,p in net.named_parameters() if p.requires_grad  and  ('adapter' in  k )]
+optimizer = optim.SGD(fwd_paras, lr=learning_rate,momentum=0.9)
+# lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,max_lr=1,total_steps=args.comm_round)
+optim_state = optimizer.state_dict()
 
 import time
 clients = np.arange(args.n_parties)
@@ -183,6 +186,7 @@ if args.bptrain or args.fwdtrain_grad:
 
         for client_id in pit(selected_clients, color = 'red'):
             param_dict = {}
+            param_dict['optim_state'] = optim_state
             # print('Now is the client {}'.format(client_id))
             
             # 每轮每个client开始先接收global参数
@@ -216,8 +220,12 @@ if args.bptrain or args.fwdtrain_grad:
         #     # global_para = {k: v.data.clone() for k, v in net.state_dict().items() if "head" in k or "adapter" in k}
         # else:
         print(f"Client training time = {time.time()-start:.2f}s")
-        fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients)
-        net.load_state_dict(global_para,strict = False)
+        global_para = fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients)
+        fwd_para = [v for k, v in global_para.items() if 'adapter' in k]
+        torch.nn.utils.clip_grad_norm_(fwd_para, 1)
+        # lr_scheduler.step()
+        optim_state = optimizer.state_dict()
+        optim_state['state'] = {i:{'momentum_buffer': p.grad} for i, p in enumerate(fwd_para)}
             # global_para = {k:copy.deepcopy(v.detach()) for k, v in avg_global_para.items()}
 
         # net.load_state_dict(global_para,strict = False)

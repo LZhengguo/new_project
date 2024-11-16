@@ -115,12 +115,12 @@ def compute_accuracy_loss_our(model, dataloader, device="cpu",prototype = None,a
             out = output['logits']       
             _, pred_label = torch.max(out.data, 1)
             loss = criterion(out, target)
-            correct += (pred_label == target.data).sum().item()
-            total_loss += loss.item()
+            correct += (pred_label == target.data).sum()
+            total_loss += loss
             batch_count += 1
             total += x.data.size()[0]
 
-    return correct, total, total_loss/batch_count
+    return correct.item(), total, total_loss.div_(batch_count).item()
 
 
 def compute_accuracy_simple_our(model, dataloader, get_confusion_matrix=False, args = None):
@@ -199,14 +199,15 @@ def dict2matrix(state_dic, keys=None):
     """
     if keys is None:
         keys = list(state_dic.keys())
-    param_vector = state_dic[keys[0]].flatten()
-    for key in keys[1:]:
+    param_list = []
+    for key in keys:
         param = state_dic[key]
         if len(list(param.size())) == 0:
-            param_vector = torch.cat((param_vector, param.view(1)), 0)
+            param_list += [param.view(1)]
         else:
-            param_vector = torch.cat((param_vector, param.flatten()), 0)
-    return param_vector.data
+            param_list += [param.flatten()]
+    param_vector = torch.cat(param_list, dim=0)
+    return param_vector
 
 def matrix2dict(x, dnn_struct):
         weights = OrderedDict()
@@ -250,7 +251,9 @@ def fedsgd_aggregation_fwd_fwdgrad(net, optimizer, net_struct, fed_avg_freqs, ar
 
 def fedavg_aggregation_bp(clients_para, global_para, fed_avg_freqs, selected_clients):
     for k,v in global_para.items():
-        v.data = torch.stack([clients_para[client_id][k] for client_id in selected_clients]).mean(dim=0)
+        new_p = torch.stack([clients_para[client_id][k] for client_id in selected_clients]).mean(dim=0)
+        v.grad = v.data.sub_(new_p)
+        v.data = new_p
     return global_para
 
 
@@ -416,16 +419,11 @@ def train_local_twostage(net,args,param_dict):
 
 @torch.no_grad()
 @torch.compile()
-def computejvp(net, p_params, trainable_params, trainable_struct, x, labels, h, loss):
+def computejvp(net, p_params, trainable_params, x, labels, h, loss):
     """
     Calculations Jacobian-vector product using numerical differentiation
     """
     # with autocast():
-    # param = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
-    # param1 = {k: v + p_params[i] for i, (k,v) in enumerate(trainable_params.items())}
-    # param1 = matrix2dict(trainable_tensor + p_params, trainable_struct)
-
-    # net.load_state_dict(param1, strict=False)
     for k, v in net.named_parameters():
         if k in trainable_params:
             v.data = trainable_params[k] + p_params[k]
@@ -593,9 +591,27 @@ def pit(it, *pargs, **nargs):
             ctr.close()
 
 @torch.compile()
+@torch.no_grad()
+def compute_fwd_grad(net, x, labels, trainable_named_param, perturb_num, loss, h, old_grad=None):
+    p_params = [OrderedDict() for i in range(perturb_num)]
+    fwd_grads = {}
+    size = {}
+    for k, v in trainable_named_param.items():
+        mask = torch.rand_like(v) < 0.5
+        size[k] = torch.Size([perturb_num] + list(v.shape))
+        fwd_grads[k] = torch.randn(size[k], device=v.device).mul_(mask).mul_(h)
+        # if old_grad is not None:
+        #     fwd_grads[k].add_(old_grad[k].mul_(0.9))
+        p_param = fwd_grads[k] + v.data
+        for i in range(perturb_num):
+            p_params[i][k] = p_param[i]
+    jvp = torch.stack([computeloss(net, p_param, x, labels) for p_param in p_params]).sub_(loss).div_(h)
+    # print(jvp)
+    fwd_grad = {k:v.T.mul_(jvp).mean(-1).T for k,v in fwd_grads.items()}
+    return fwd_grad
+
 def train_local_fwd(net, args, param_dict, client_first_grad=None):
     train_dataloader = param_dict['train_dataloader']
-    round = param_dict['round']
     device = args.device
     trainable_named_para = {k: v for k, v in net.named_parameters() if v.requires_grad == True and 'head' not in k}
     trainable_data = [v.data for v in trainable_named_para.values()]
@@ -603,6 +619,7 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     trainable_para = trainable_named_para.values()
     
     for p in trainable_para:
+        p.grad = torch.zeros_like(p.data)
         p.requires_grad = False
     # 积累本轮fwdgrad
     net.eval()
@@ -643,31 +660,38 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     #         p_buffer[layer_id] = [candidate_p[i].reshape(v.shape) for i in sorted_indices[:args.epochs * batch_num]]  
     #     layer_id += 1
     #执行前向传播
+    h = args.h
     head = [v for v in net.parameters() if v.requires_grad == True]
-    head_optimizer = torch.optim.SGD(head, lr=args.lr)
-    optimizer = torch.optim.SGD(trainable_para, lr=args.lr)
-    for epoch in range(args.epochs):
+    head_optimizer = torch.optim.SGD(head, lr=0.01,momentum=0.9)
+    # head_lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(head_optimizer,max_lr=0.01,total_steps=args.epochs*len(train_dataloader))
+    optimizer = torch.optim.SGD(trainable_para, lr=1, momentum=0.9)
+    old_grad = None
+    if param_dict['optim_state'] is not None:
+        optimizer.load_state_dict(param_dict['optim_state'])
+        # h *= param_dict['optim_state']['param_groups'][0]['lr']
+    if param_dict['round'] > 0:
+        old_grad = {k:v['momentum_buffer'] for k, v in zip(trainable_named_para.keys(), param_dict['optim_state']['state'].values())}
+    for epoch in pit(range(args.epochs), color = 'green'):
         for x,labels in pit(train_dataloader, color = 'blue'):
             x, labels = x.to(args.device), labels.long().to(args.device)
+            # with torch.no_grad():
             y = net(x)
             loss = F.cross_entropy(y['logits'], labels)
             loss.backward()
-            with torch.no_grad():
-                trainable_tensor_extend = dict2matrix(trainable_named_para).unsqueeze_(0).expand(args.perturb_num, -1)
-                noise = torch.randn_like(trainable_tensor_extend).mul_(args.h)
-                p_params = trainable_tensor_extend + noise
-                jvp = torch.stack([computeloss(net, matrix2dict(p_params[i], trainable_struct), x, labels) for i in range(args.perturb_num)]).sub_(loss)
-                for p, d, fwdgrad in zip(trainable_para, trainable_data, matrix2dict(noise.T.mv(jvp.div_(args.h * args.perturb_num)), trainable_struct).values()):
-                    p.data = d # restore data
-                    p.grad = fwdgrad
-            #     if i == args.check_layer_id:
-            #         grad_for_var_check_list.append(jvp*p_params[i])
-                torch.nn.utils.clip_grad_norm_(trainable_para, 1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-                torch.nn.utils.clip_grad_norm_(head, 1.0)
-                head_optimizer.step()
-                head_optimizer.zero_grad()
+            fwd_grad = compute_fwd_grad(net, x, labels, trainable_named_para, args.perturb_num, loss, h, old_grad)
+            for p, d, fwdgrad in zip(trainable_para, trainable_data, fwd_grad.values()):
+                p.data = d # restore data
+                p.grad.add_(fwdgrad)
+        #     if i == args.check_layer_id:
+        #         grad_for_var_check_list.append(jvp*p_params[i])
+        torch.nn.utils.clip_grad_norm_(trainable_para, 1.0)
+        old_grad = {k:v.grad for k, v in trainable_named_para.items()}
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=False)
+        torch.nn.utils.clip_grad_norm_(head, 1.0)
+        head_optimizer.step()
+        head_optimizer.zero_grad()
+        # head_lr_scheduler.step()
                 ########### data_ptr check ###########
                 # for p, d in zip(trainable_para, trainable_data):
                 #     assert p.data.data_ptr() == d.data_ptr()
