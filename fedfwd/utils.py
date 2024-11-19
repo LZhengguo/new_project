@@ -19,6 +19,7 @@ import torch, torch.nn as nn, torch.nn.functional as F
 import math
 from torch.cuda.amp import autocast
 import logging
+import time
 # from pypapi import events, papi_high as high
 
 logging.basicConfig()
@@ -178,6 +179,19 @@ def compute_accuracy_simple_our(model, dataloader, get_confusion_matrix=False, a
         return correct/float(total), conf_matrix
 
     return correct/float(total)
+
+def fedavg_aggregation_test(clients_para, global_para, fed_avg_freqs, args, selected):
+    avg_global_para = {}
+    for k,v in global_para.items():
+        tensor_sample = torch.zeros_like(v)
+        for client_id in selected:
+            tensor_sample += clients_para[client_id][k]*fed_avg_freqs[client_id]
+        avg_global_para[k] = tensor_sample.clone()
+    if args.use_momentum:
+        momentum_f = args.momentum_f
+        for k,v in global_para.items():
+            avg_global_para[k] = momentum_f*v + (1-momentum_f)*avg_global_para[k]
+    return avg_global_para
 
 def fedavg_aggregation(clients_para, global_para, fed_avg_freqs, args, selected):
     avg_global_para = {}
@@ -347,6 +361,18 @@ def train_local_twostage(net,args,param_dict):
         #     dict_loss["val/test_acc_epoch"] = test_acc    
     return output['embedding_dict']
 
+def timecost(func):
+    """
+    直接在需要测的函数上@就完事了
+    """
+    def wrapper(*args,**kwargs):
+        starttime = time.perf_counter()
+        res = func(*args,**kwargs)
+        endtime = time.perf_counter()
+        print(f"{func} executing time cost is {endtime-starttime}s!")
+        return res
+    return wrapper
+        
 @torch.no_grad
 def computejvp(net, p_params, trainable_params, x, labels, h, loss):
     """
@@ -400,7 +426,8 @@ def use_bp_first(net, args, param_dict):
     optimizer.zero_grad()
     return bp_grad
 
-def train_local_fwd_var(net, args, param_dict, client_first_grad=None):
+@timecost
+def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
@@ -413,67 +440,10 @@ def train_local_fwd_var(net, args, param_dict, client_first_grad=None):
     net.eval()
 
     batch_num = len(train_dataloader)
-    print("batch的数量是",batch_num)
+    # print("batch的数量是",batch_num)
     
-    optimizer = torch.optim.SGD(trainable_tensor, lr=1.0)
-    with torch.no_grad():
-        for epoch in range(args.epochs):
-            for batch_idx, (x,labels,_) in enumerate(train_dataloader):
-                x, labels = x.to(device), labels.to(device)
-                labels = labels.long()
-                y = net(x)
-                pred = y['logits']
-                loss = F.cross_entropy(pred, labels)
-                fwdgrad_checklist = []
+    optimizer = torch.optim.SGD(trainable_tensor, lr=6)
 
-                while True:
-                    for i in range(args.perturb_num):
-                        p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
-                        jvp = computejvp(net, p_params, trainable_para, x, labels, args.lr, loss)
-                        
-                        for p, perturb in zip(trainable_tensor, p_params.values()):
-                            p.grad.data.add_(jvp*perturb)
-                            if not perturb.is_contiguous():
-                                perturb = perturb.contiguous()
-                            perturb = jvp*perturb.clone().view(-1)
-                            fwdgrad_checklist.extend(perturb.tolist())
-                    
-                    # grad_var = computevar(fwdgrad_checklist)
-                    # if grad_var < args.var_threshold:
-                    #     print("The var of fwd grad is %f"%(grad_var))
-                    #     break
-                    grad_var = np.var(fwdgrad_checklist)
-                    if grad_var < 5:
-                        print("The var of fwd grad is %f"%(grad_var))
-                        break
-                for k, v in net.named_parameters():
-                    if v.requires_grad == True:
-                        v.data = trainable_para[k]
-
-                torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=False)                
-                # log
-                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
-
-    return net
-
-def train_local_fwd(net, args, param_dict, client_first_grad=None):
-    train_dataloader = param_dict['train_dataloader']
-    round = param_dict['round']
-    device = args.device
-    trainable_para = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
-    trainable_tensor = trainable_para.values()
-
-    for p in trainable_tensor:
-        p.grad = torch.zeros_like(p)
-    
-    net.eval()
-
-    batch_num = len(train_dataloader)
-    print("batch的数量是",batch_num)
-    
-    optimizer = torch.optim.SGD(trainable_tensor, lr=1.0)
     with torch.no_grad():
         for epoch in range(args.epochs):
             for batch_idx, (x,labels,_) in enumerate(train_dataloader):
@@ -499,7 +469,53 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
                 optimizer.zero_grad(set_to_none=False)                
                 # log
                 # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
+    return net
 
+def train_local_fwd(net, args, param_dict, client_first_grad=None):
+    train_dataloader = param_dict['train_dataloader']
+    round = param_dict['round']
+    device = args.device
+    trainable_para = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
+    trainable_tensor = trainable_para.values()
+
+    for p in trainable_tensor:
+        p.grad = torch.zeros_like(p)
+    
+    net.eval()
+
+    batch_num = len(train_dataloader)
+    print("batch的数量是",batch_num)
+    
+    optimizer = torch.optim.SGD(trainable_tensor, lr=6)
+
+    starttime = time.perf_counter()
+    with torch.no_grad():
+        for epoch in range(args.epochs):
+            for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+                x, labels = x.to(device), labels.to(device)
+                labels = labels.long()
+                y = net(x)
+                pred = y['logits']
+                loss = F.cross_entropy(pred, labels)
+
+                for i in range(args.perturb_num):
+                    p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
+                    jvp = computejvp(net, p_params, trainable_para, x, labels, args.lr, loss)
+
+                    for p, perturb in zip(trainable_tensor, p_params.values()):
+                        p.grad.data.add_(jvp*perturb)
+
+                for k, v in net.named_parameters():
+                    if v.requires_grad == True:
+                        v.data = trainable_para[k]
+
+                torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=False)                
+                # log
+                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
+    endtime = time.perf_counter() - starttime
+    print("单个epoch耗时",endtime)
     return net
 
 def train_local_bp(net, args, param_dict):

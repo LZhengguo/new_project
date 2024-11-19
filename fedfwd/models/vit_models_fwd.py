@@ -338,7 +338,6 @@ class VisionTransformerForward(nn.Module):
         self.use_bitfit = False
         self.use_lora = False
         #下面用来创建peft层
-        # todo
         self.peftmode = args.peftmode
         if self.peftmode == "lora":
             print("Use lora!")

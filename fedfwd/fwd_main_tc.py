@@ -1,4 +1,3 @@
-
 import numpy as np
 import json
 import torch
@@ -16,6 +15,9 @@ from utils import *
 import argparse
 from models.vit_models_fwd import *
 import time
+from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, as_completed
+import concurrent.futures
+from tqdm import tqdm
 
 import logging
 
@@ -48,10 +50,12 @@ def get_args():
     parser.add_argument('--test_round', type=int, default=50)  
     parser.add_argument('--root_path', type=str, default='', help='Noise type: None/increasng/space')
     parser.add_argument('--var_control', action='store_true', help="whether use var to control perturb sample times")
+    parser.add_argument('--test', action='store_true', help="Only for developer to test")
     parser.add_argument('--var_threshold', type=float, default=0.5, help='the threshold of perturb variance')
     parser.add_argument('--gap_layer', type=int, default=5, help='per k layer apply one adpater or lora block')
     parser.add_argument('--perturb_num', type=int, default=10, help='num of noise in fwd perturb')
     parser.add_argument('--sample_num', type=int, help='num of random clients participating train per round')
+    parser.add_argument('--use_momentum', action='store_true', help='weather to use momentum')
     """
     Used for model 
     """
@@ -66,6 +70,7 @@ def get_args():
     parser.add_argument('--lora_alpha',type=float,default=1, help='scaling factor of lora config')
     parser.add_argument('--lora_rank',type=int,default=4, help='lora rank')
     parser.add_argument('--n_prompt',type=int,default=1, help='the num of tokens appended before prompt (prompt tuning)')
+    parser.add_argument('--momentum_f', type=float, default=0.5, help='momentum factor')
     
     args = parser.parse_args()
     return args
@@ -119,14 +124,38 @@ elif args.dataset == 'domainnet':
 else:
     ###### Data Set related ###### 
     data_loader_dict = {}
-    for net_id in range(args.n_parties):
+    num_classes = 100
+    def load_data(net_id, args, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts):
+        """
+        Helper function to load data for a single party.
+        """
         dataidxs_train = net_dataidx_map_train[net_id]
         dataidxs_test = net_dataidx_map_test[net_id]
-        data_loader_dict[net_id] = {}
-        train_dl_local, test_dl_local, _, _ ,_,_ = get_divided_dataloader(args, dataidxs_train, dataidxs_test,traindata_cls_counts=traindata_cls_counts[net_id])
-        num_classes = 100
-        data_loader_dict[net_id]['train_dl_local'] = train_dl_local
-        data_loader_dict[net_id]['test_dl_local'] = test_dl_local
+        train_dl_local, test_dl_local, _, _, _, _ = get_divided_dataloader(
+            args, dataidxs_train, dataidxs_test, traindata_cls_counts=traindata_cls_counts[net_id]
+        )
+        return net_id, train_dl_local, test_dl_local
+    # python多线程因为GIL锁没几把用
+    # with ThreadPoolExecutor(max_workers=16) as executor:
+    with ProcessPoolExecutor(max_workers=8) as executor:
+        future_to_net_id = {
+            executor.submit(load_data, net_id, args, net_dataidx_map_train, net_dataidx_map_test, traindata_cls_counts): net_id
+            for net_id in range(args.n_parties)
+        }
+        with tqdm(total=len(future_to_net_id), desc="Initializing dataloader!") as pbar:
+            for future in as_completed(future_to_net_id):
+                net_id = future_to_net_id[future]
+                try:
+                    net_id, train_dl_local, test_dl_local = future.result()
+                    data_loader_dict[net_id] = {
+                        'train_dl_local': train_dl_local,
+                        'test_dl_local': test_dl_local
+                    }
+                except Exception as exc:
+                    print(f"Net ID {net_id} generated an exception: {exc}")
+                finally:
+                    pbar.update(1)
+
 
 device = args.device
 config = CONFIGS[args.model_type]
@@ -178,8 +207,8 @@ for round in range(args.comm_round):
         
         # train!
         if args.fwdtrain:
-            if args.var_control:
-                net = train_local_fwd_var(net, args, param_dict, client_first_grad)
+            if args.test:
+                net = train_local_fwd_test(net, args, param_dict, client_first_grad)
             else:
                 net = train_local_fwd(net, args, param_dict, client_first_grad)
             clients_para[client_id] = {k: v.clone() for k, v in net.named_parameters() if v.requires_grad == True}
@@ -192,7 +221,10 @@ for round in range(args.comm_round):
 
     client_totaltime = time.time()
     print(f'>> round {round} client total training time custom:{client_totaltime - start_time}') 
-    global_para = fedavg_aggregation(clients_para, global_para, fed_avg_freqs, args, selected)
+    if args.test:
+        global_para = fedavg_aggregation_test(clients_para, global_para, fed_avg_freqs, args, selected)
+    else:
+        global_para = fedavg_aggregation(clients_para, global_para, fed_avg_freqs, args, selected)
 
     # net.load_state_dict(global_para,strict = False) 
     
@@ -211,9 +243,9 @@ for round in range(args.comm_round):
     results_dict['local_min_acc'].append(local_min_acc)
     
     # for save
-    # if (round+1)>=args.test_round:
-    #     outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
-    #     torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
+    if (round+1)>=args.test_round:
+        outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
+        torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
 
 json_file_opt = "results.json"
 with open(os.path.join(save_path,json_file_opt), "w") as file:
