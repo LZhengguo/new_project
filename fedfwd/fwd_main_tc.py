@@ -34,7 +34,7 @@ def get_args():
     parser.add_argument('--dataset', type=str, default='cifar100', help='dataset used for training')
     parser.add_argument('--partition', type=str, default='noniid-labeluni', help='the data partitioning strategy')
     parser.add_argument('--batch_size', type=int, default=64, help='input batch size for training (default: 64)')
-    parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
+    parser.add_argument('--h', type=float, default=0.01, help='perturb learning rate (default: 0.01)')
     parser.add_argument('--epochs', type=int, default=1, help='number of local epochs')
     parser.add_argument('--n_parties', type=int, default=10,  help='number of workers in a distributed cluster')
     parser.add_argument('--comm_round', type=int, default=60, help='number of maximum communication roun')
@@ -56,6 +56,11 @@ def get_args():
     parser.add_argument('--perturb_num', type=int, default=10, help='num of noise in fwd perturb')
     parser.add_argument('--sample_num', type=int, help='num of random clients participating train per round')
     parser.add_argument('--use_momentum', action='store_true', help='weather to use momentum')
+    """
+    Used for fwdllm    
+    """
+    parser.add_argument('--Fwdllm', action='store_true', help='Use the method of Fwdllm')
+    parser.add_argument('--layer_id_for_check', type=int, default=0, help='choose layer to compute var')
     """
     Used for model 
     """
@@ -204,13 +209,18 @@ for round in range(args.comm_round):
         param_dict = {}
         param_dict['train_dataloader'] = train_dl_local
         param_dict['round'] = round
+        if args.Fwdllm:
+            param_dict['oldgrad'] = global_grad
         
         # train!
         if args.fwdtrain:
-            if args.test:
-                net = train_local_fwd_test(net, args, param_dict, client_first_grad)
+            if args.Fwdllm:
+                net, global_grad = train_local_fwdllm(net, args, param_dict)
             else:
-                net = train_local_fwd(net, args, param_dict, client_first_grad)
+                if args.test:
+                    net = train_local_fwd_test(net, args, param_dict, client_first_grad)
+                else:
+                    net = train_local_fwd(net, args, param_dict, client_first_grad)
             clients_para[client_id] = {k: v.clone() for k, v in net.named_parameters() if v.requires_grad == True}
         else:
             net = train_local_bp(net, args, param_dict)

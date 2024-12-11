@@ -379,7 +379,7 @@ def computejvp(net, p_params, trainable_params, x, labels, h, loss):
     Calculations Jacobian-vector product using numerical differentiation
     """
     for k, v in net.named_parameters():
-        if v.requires_grad == True:
+        if k in p_params:
             v.data = trainable_params[k] + h * p_params[k]
             # v.data += h * p_params[k]
         
@@ -431,44 +431,60 @@ def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
-    trainable_para = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True}
+    
+    trainable_para = {k: v.data for k, v in net.named_parameters() if v.requires_grad == True and "head" not in k}
     trainable_tensor = trainable_para.values()
-
+    head_tensor = [v for k,v in net.named_parameters() if "head" in k]
+    
     for p in trainable_tensor:
         p.grad = torch.zeros_like(p)
+        # p.requires_grad == False
     
+    for k,v in net.named_parameters():
+        if "head" not in k:
+            v.requires_grad = False
+
     net.eval()
 
     batch_num = len(train_dataloader)
     # print("batch的数量是",batch_num)
     
-    optimizer = torch.optim.SGD(trainable_tensor, lr=6)
+    trainable_optimizer = torch.optim.SGD(trainable_tensor, lr=1)
+    head_optimizer = torch.optim.SGD(head_tensor, lr=0.01)
 
-    with torch.no_grad():
-        for epoch in range(args.epochs):
-            for batch_idx, (x,labels,_) in enumerate(train_dataloader):
-                x, labels = x.to(device), labels.to(device)
-                labels = labels.long()
-                y = net(x)
-                pred = y['logits']
-                loss = F.cross_entropy(pred, labels)
+    # with torch.no_grad():
+    for epoch in range(args.epochs):
+        for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+            x, labels = x.to(device), labels.to(device)
+            labels = labels.long()
+            y = net(x)
+            pred = y['logits']
+            loss = F.cross_entropy(pred, labels)
+            loss.backward()
 
-                for i in range(args.perturb_num):
-                    p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
-                    jvp = computejvp(net, p_params, trainable_para, x, labels, args.lr, loss)
+            for i in range(args.perturb_num):
+                p_params = {k: torch.randn_like(v) for k, v in trainable_para.items()}
+                jvp = computejvp(net, p_params, trainable_para, x, labels, args.h, loss)
 
-                    for p, perturb in zip(trainable_tensor, p_params.values()):
-                        p.grad.data.add_(jvp*perturb)
+                for p, perturb in zip(trainable_tensor, p_params.values()):
+                    p.grad.add_(jvp*perturb)
 
-                for k, v in net.named_parameters():
-                    if v.requires_grad == True:
-                        v.data = trainable_para[k]
+            for k, v in net.named_parameters():
+                if k in trainable_para.keys():
+                    v.data = trainable_para[k]
 
-                torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=False)                
-                # log
-                # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
+        torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
+        trainable_optimizer.step()
+        trainable_optimizer.zero_grad(set_to_none=False)
+        torch.nn.utils.clip_grad_norm_(head_tensor, 1.0)
+        head_optimizer.step()
+        head_optimizer.zero_grad()
+
+            # log
+            # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
+    for k, v in net.named_parameters():
+        if k in trainable_para.keys():
+            v.requires_grad = True
     return net
 
 def train_local_fwd(net, args, param_dict, client_first_grad=None):
@@ -486,7 +502,7 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     batch_num = len(train_dataloader)
     print("batch的数量是",batch_num)
     
-    optimizer = torch.optim.SGD(trainable_tensor, lr=6)
+    optimizer = torch.optim.SGD(trainable_tensor, lr=1)
 
     starttime = time.perf_counter()
     with torch.no_grad():
@@ -500,7 +516,7 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
 
                 for i in range(args.perturb_num):
                     p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
-                    jvp = computejvp(net, p_params, trainable_para, x, labels, args.lr, loss)
+                    jvp = computejvp(net, p_params, trainable_para, x, labels, args.h, loss)
 
                     for p, perturb in zip(trainable_tensor, p_params.values()):
                         p.grad.data.add_(jvp*perturb)
@@ -517,6 +533,120 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     endtime = time.perf_counter() - starttime
     print("单个epoch耗时",endtime)
     return net
+
+### for fwdllm
+def calculatejvp(x, labels, net, v_params, trainable_para):
+    h = 0.01
+    param1 = {k:trainable_para[k]+h*v_params[k] for k in v_params.keys()}
+    param2 = {k:trainable_para[k]-h*v_params[k] for k in v_params.keys()}
+
+    net.load_state_dict(param1, strict=False)
+    y1 = net(x)
+    pred1 = y1['logits']
+    loss1 = F.cross_entropy(pred1, labels)
+
+    net.load_state_dict(param2, strict=False)
+    y2 = net(x)
+    pred2 = y2['logits']
+    loss2 = F.cross_entropy(pred2, labels)
+
+    jvp = (loss1 - loss2)/(2*h)
+    return jvp
+
+def calculate_cos_sim(candidate_v,target_grad,device):
+    cos_sim = torch.empty(candidate_v.size(0))
+    for i in range(candidate_v.size(0)):
+        v = candidate_v[i].to(device)
+        sim = torch.cosine_similarity(v, target_grad, dim=-1)
+        cos_sim[i] = sim
+    return cos_sim
+
+def calculate_var(fwdgrad_list):
+    n = len(fwdgrad_list)
+    first_half_mean = torch.mean(torch.stack(fwdgrad_list[:n//2]), dim=0)
+    second_half_mean = torch.mean(torch.stack(fwdgrad_list[n//2:]), dim=0)
+    var = torch.var(torch.stack([first_half_mean, second_half_mean]), dim=0).mean()
+    return var
+    
+def train_local_fwdllm(net, args, param_dict):
+    train_dataloader = param_dict['train_dataloader']
+    round = param_dict['round']
+    device = args.device
+    trainable_para = {k: v.data.clone() for k, v in net.named_parameters() if v.requires_grad == True}
+
+    grad_pool = []
+    if round%2==0:
+        oldgrad = param_dict['oldgrad']
+    else:
+        oldgrad = None
+    trainnum = 0
+    while True:
+        grad_for_var_check_list = []
+        v_num = len(train_dataloader)
+        v_buffer = {}
+        
+        for k,v in net.named_parameters():
+            if oldgrad != None and v.requires_grad:
+                shape = v.shape
+                candidate_v = torch.randn((v_num*10,*shape),device="cpu")
+                target_grad = oldgrad[k]
+                target_grad = torch.flatten(target_grad)
+                candidate_v = torch.flatten(candidate_v,start_dim=1)
+                cos_sim = calculate_cos_sim(candidate_v,target_grad,device)
+                sorted_values, sorted_indices = torch.sort(cos_sim, descending=True)
+                v_buffer[k] = [candidate_v[i].reshape(v.shape) for i in sorted_indices[:v_num]]
+
+        fwdgrad = [torch.zeros_like(p) for p in net.parameters() if p.requires_grad == True]
+
+        with torch.no_grad():
+            for epoch in range(args.epochs):
+                for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+                    x, labels = x.to(device), labels.to(device)
+                    labels = labels.long()
+
+                    if v_buffer != {}:
+                        v_params = {k:v_buffer[k][batch_idx].to(device) for k,p in net.named_parameters() if p.requires_grad == True}
+                    else:
+                        v_params = {k:torch.randn_like(p) for k,p in net.named_parameters() if p.requires_grad == True}
+
+                    jvp = calculatejvp(x, labels, net, v_params, trainable_para)
+
+                    for idx, (fg, v) in enumerate(zip(fwdgrad,v_params.values())):
+                        fg.add_(jvp*v)
+                        if args.var_control and idx == args.layer_id_for_check:
+                            grad_for_var_check_list.append(jvp*v)
+        
+        if args.var_control:
+            var = calculate_var(grad_for_var_check_list)
+            print(f"num of fwdgrad: {len(grad_for_var_check_list)}, var: {var}")
+            # grad_pool = [[tensor1,...,tensor5],[tensor1,...,tensor5]]
+            grad_pool.append(fwdgrad)
+        
+        trainnum += v_num
+        if var <= args.var_threshold:
+            break
+        else:
+            print(f"net is not good enough, trainnum is {trainnum}")
+
+    fwdg = grad_pool[0]
+    for id, (fg,v) in enumerate(zip(fwdg,trainable_para.values())):
+        for i in range(len(grad_pool)):
+            if i==0:
+                continue
+            else:
+                fg.add_(grad_pool[i][id])
+        v.sub_(0.01*fg/trainnum)
+
+    net.load_state_dict(trainable_para, strict=False)
+
+    grad = {}
+    for k,g in zip(trainable_para.keys(),fwdg): 
+        grad[k] = g
+    
+    return net, grad
+
+
+    
 
 def train_local_bp(net, args, param_dict):
     train_dataloader = param_dict['train_dataloader']
