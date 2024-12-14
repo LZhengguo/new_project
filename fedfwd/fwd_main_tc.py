@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor,ProcessPoolExecutor, as_comple
 import concurrent.futures
 from tqdm import tqdm
 
+import pandas as pd
 import logging
 
 # logging.basicConfig(
@@ -61,6 +62,7 @@ def get_args():
     """
     parser.add_argument('--Fwdllm', action='store_true', help='Use the method of Fwdllm')
     parser.add_argument('--layer_id_for_check', type=int, default=0, help='choose layer to compute var')
+    parser.add_argument('--headbp', action='store_true', help='the part of head use bp method')
     """
     Used for model 
     """
@@ -76,6 +78,8 @@ def get_args():
     parser.add_argument('--lora_rank',type=int,default=4, help='lora rank')
     parser.add_argument('--n_prompt',type=int,default=1, help='the num of tokens appended before prompt (prompt tuning)')
     parser.add_argument('--momentum_f', type=float, default=0.5, help='momentum factor')
+    parser.add_argument('--bp_lr', type=float, default=0.01, help='learning rate for bp')
+    parser.add_argument('--m', action='store_true', help='use moment in fedfwd method')
     
     args = parser.parse_args()
     return args
@@ -186,8 +190,7 @@ results_dict = defaultdict(list)
 ### grad
 global_grad = None
 client_first_grad = None
-
-start_time = time.time()
+old_optim_state = None
 
 client_arr = np.arange(args.n_parties)
 
@@ -198,8 +201,9 @@ for round in range(args.comm_round):
 
     np.random.shuffle(client_arr)
     selected = client_arr[:args.sample_num]
-    fed_avg_freqs={}
-
+    fed_avg_freqs = {}
+    totaltimelist = []
+    onebatchtimelist = []
     for client_id in selected:
         print('Now is the client {}'.format(client_id))
 
@@ -209,54 +213,90 @@ for round in range(args.comm_round):
         param_dict = {}
         param_dict['train_dataloader'] = train_dl_local
         param_dict['round'] = round
+        if args.headbp:
+            param_dict['optim_state'] = old_optim_state
         if args.Fwdllm:
             param_dict['oldgrad'] = global_grad
         
         # train!
         if args.fwdtrain:
             if args.Fwdllm:
-                net, global_grad = train_local_fwdllm(net, args, param_dict)
+                net, global_grad, totaltraintime, onebatchtime = train_local_fwdllm(net, args, param_dict)
             else:
-                if args.test:
-                    net = train_local_fwd_test(net, args, param_dict, client_first_grad)
+                if args.headbp:
+                    if args.m:
+                        net, totaltraintime, onebatchtime, optim_state = train_local_fwd_test(net, args, param_dict, client_first_grad)
+                    else:
+                        net, totaltraintime, onebatchtime = train_local_fwd_test(net, args, param_dict, client_first_grad)
                 else:
-                    net = train_local_fwd(net, args, param_dict, client_first_grad)
+                    net, totaltraintime, onebatchtime = train_local_fwd(net, args, param_dict, client_first_grad)
             clients_para[client_id] = {k: v.clone() for k, v in net.named_parameters() if v.requires_grad == True}
         else:
-            net = train_local_bp(net, args, param_dict)
+            net, totaltraintime, onebatchtime = train_local_bp(net, args, param_dict)
             clients_para[client_id] = {k: v.clone() for k, v in net.named_parameters() if v.requires_grad == True}
+        totaltimelist.append(totaltraintime)
+        onebatchtimelist.append(onebatchtime)
 
     total_data_points = sum([len(net_dataidx_map_train[r]) for r in selected])
     fed_avg_freqs = {r:len(net_dataidx_map_train[r]) / total_data_points for r in selected}
 
-    client_totaltime = time.time()
-    print(f'>> round {round} client total training time custom:{client_totaltime - start_time}') 
-    if args.test:
+    if args.headbp:
         global_para = fedavg_aggregation_test(clients_para, global_para, fed_avg_freqs, args, selected)
+        if args.m:
+            old_optim_state = optim_state
     else:
         global_para = fedavg_aggregation(clients_para, global_para, fed_avg_freqs, args, selected)
 
     # net.load_state_dict(global_para,strict = False) 
     
     # evaluate一下
-    end_time = time.time()
-    print(f'>> round {round} total time custom:{end_time - start_time}') 
+
     test_results, test_avg_loss, test_avg_acc, local_mean_acc,local_min_acc = compute_accuracy_fwd(net, data_loader_dict, args)
     print('>> Mean Local Test accuracy: %f' % local_mean_acc)
     print('>> Min Local Test accuracy: %f' % local_min_acc)
     print('>> Global Model Test accuracy: %f' % test_avg_acc)
     print('>> Test avg loss: %f' %test_avg_loss)
 
+    results_dict['round'].append(round)
+    results_dict['client_sample'].append(copy.deepcopy(selected))
     results_dict['test_avg_loss'].append(test_avg_loss)
     results_dict['test_avg_acc'].append(test_avg_acc)
     results_dict['local_mean_acc'].append(local_mean_acc)
     results_dict['local_min_acc'].append(local_min_acc)
+    results_dict['total_traintime_cost'].append(copy.deepcopy(totaltimelist))
+    results_dict['train_onebatch_time'].append(copy.deepcopy(onebatchtimelist))
     
     # for save
-    if (round+1)>=args.test_round:
-        outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
-        torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
+    # if (round+1)>=args.test_round:
+    #     outfile_vit = os.path.join(save_path, 'Vit_1500_round{}.tar'.format(round))
+    #     torch.save({'epoch':args.comm_round+1, 'state':net.state_dict()}, outfile_vit)
 
-json_file_opt = "results.json"
-with open(os.path.join(save_path,json_file_opt), "w") as file:
-    json.dump(results_dict, file, indent=4)
+# json_file_opt = "results.json"
+# with open(os.path.join(save_path,json_file_opt), "w") as file:
+#     json.dump(results_dict, file, indent=4)
+
+# create xlsx
+if args.fwdtrain:
+    if args.Fwdllm:
+        df = pd.DataFrame(results_dict)
+        df.to_excel("result_Fwdllm.xlsx")
+        print("Complete Excel!")
+    else:
+        # for fwdfed
+        if args.headbp:
+            if args.m:
+                df = pd.DataFrame(results_dict)
+                df.to_excel("result_Fwdfed_headbp_moment.xlsx")
+                print("Complete Excel!")
+            else:
+                df = pd.DataFrame(results_dict)
+                df.to_excel("result_Fwdfed_headbp.xlsx")
+                print("Complete Excel!")
+        else:
+            df = pd.DataFrame(results_dict)
+            df.to_excel("result_Fwdfed_origin.xlsx")
+            print("Complete Excel!")
+else:
+    df = pd.DataFrame(results_dict)
+    df.to_excel("result_bp.xlsx")
+    print("Complete Excel!")

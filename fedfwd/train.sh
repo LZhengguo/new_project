@@ -18,32 +18,44 @@
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
 #         --partition noniid-labeluni --n_parties 100 --cls_num 50 --beta 0.01 --device cuda:3 \
 #         --comm_round 100  --test_round 50 --sample_num 5 \
-#         --dataset cifar100 --lr 0.01 --epochs 5 --batch_size 40\
+#         --dataset cifar100 --bp_lr 0.01 --epochs 5 --batch_size 40\
 #         --gap_layer 5 \
 #         --bptrain \
-#         --peftmode adapter > /home/lzg/sgpt/SGPT/logs/bptrain.log
+#         --peftmode adapter
 #         --peftmode prompt_tuning 
 #         --peftmode adapter 
 #         --peftmode lora
 #         --peftmode bitfit
 #         --test --use_momentum --momentum_f 0.1
-### our fwd test
+### fwdfed new
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
 #         --partition noniid-labeluni --n_parties 100 --cls_num 50 --beta 0.01 --device cuda:3 \
 #         --comm_round 100  --test_round 50 --sample_num 5 \
-#         --dataset cifar100 --lr 0.01 --epochs 5 --batch_size 40\
+#         --dataset cifar100 --epochs 5 --batch_size 40 \
+#         --perturb_num 20 --h 0.01 \
 #         --gap_layer 5 \
-#         --fwdtrain \
-#         --peftmode adapter > /home/lzg/sgpt/SGPT/logs/fwdtrain.log
+#         --fwdtrain --headbp --m \
+#         --peftmode adapter
 
-### fwdllm test
+### fwdfed origin
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
-#         --partition noniid-labeluni --n_parties 100 --cls_num 50 --beta 0.01 --device cuda:3 \
+#         --partition noniid-labeluni --n_parties 100 --cls_num 50 --beta 0.01 --device cuda:1 \
 #         --comm_round 100  --test_round 50 --sample_num 5 \
-#         --dataset cifar100 --lr 0.01 --epochs 5 --batch_size 40\
+#         --dataset cifar100 --epochs 5 --batch_size 40 \
 #         --gap_layer 5 \
-#         --fwdtrain --Fwdllm \
-#         --peftmode adapter > /home/lzg/sgpt/SGPT/logs/fwdllmtrain.log
+#         --perturb_num 20 --h 0.01 \
+#         --fwdtrain \
+#         --peftmode adapter
+
+### fwdllm
+python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
+        --partition noniid-labeluni --n_parties 100 --cls_num 50 --beta 0.01 --device cuda:2 \
+        --comm_round 100  --test_round 50 --sample_num 5 \
+        --dataset cifar100 --epochs 5 --batch_size 40 \
+        --var_threshold 0.1 --var_control --layer_id_for_check 11 \
+        --gap_layer 5 \
+        --fwdtrain --Fwdllm \
+        --peftmode adapter
 
 #########################################
 
@@ -67,8 +79,8 @@
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
 #         --partition noniid-labeluni --n_parties 100 --cls_num 10 --beta 0.01 --device cuda:3 \
 #         --comm_round 40  --test_round 30 --sample_num 20 \
-#         --dataset cifar100 --lr 0.01 --epochs 1 --batch_size 40\
-#         --gap_layer 5 --perturb_num 20\
+#         --dataset cifar100 --lr 0.01 --epochs 1 --batch_size 40 \
+#         --gap_layer 5 --perturb_num 20 \
 #         --bptrain \
 #         --peftmode adapter
 #         --peftmode prompt_tuning 
@@ -80,25 +92,46 @@
 
 ### OFFICE
 ### fwd
-python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
-        --n_parties 4 --cls_num 10 --device cuda:3 \
-        --comm_round 40  --test_round 30 --sample_num 2 \
-        --dataset office --h 0.01 --epochs 1 --batch_size 10 \
-        --var_threshold 0.5  --gap_layer 5 --perturb_num 20 \
-        --fwdtrain --Fwdllm \
-        --peftmode adapter --var_control
+#fwdllm
+# python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
+#         --n_parties 4 --cls_num 10 --device cuda:0 \
+#         --comm_round 10  --test_round 10 --sample_num 1 \
+#         --dataset office --epochs 1 --batch_size 10 \
+#         --var_threshold 0.5 --var_control --gap_layer 5 --layer_id_for_check 11 \
+#         --fwdtrain --Fwdllm \
+#         --peftmode adapter
 #         --peftmode prompt_tuning 
 #         --peftmode adapter 
 #         --peftmode lora
 #         --peftmode bitfit
 
+#fwdfed new
+# python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
+#         --n_parties 4 --cls_num 10 --device cuda:0 \
+#         --comm_round 5  --test_round 5 --sample_num 1 \
+#         --dataset office --epochs 5 --batch_size 10\
+#         --gap_layer 5 \
+#         --perturb_num 20 --h 0.01 --m\
+#         --fwdtrain --headbp \
+#         --peftmode adapter
+
+#fwdfed origin
+# python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
+#         --n_parties 4 --cls_num 10 --device cuda:1 \
+#         --comm_round 5  --test_round 5 --sample_num 1 \
+#         --dataset office --epochs 1 --batch_size 10\
+#         --gap_layer 5 \
+#         --perturb_num 20 --h 0.01 \
+#         --fwdtrain \
+#         --peftmode adapter
+
 ### bp test
 # python fwd_main_tc.py  --pretrained_dir checkpoints/imagenet21k_ViT-B_16.npz --model_type ViT-B_16 \
 #         --n_parties 4 --cls_num 10 --device cuda:3 \
-#         --comm_round 40  --test_round 30 --sample_num 4 \
-#         --dataset office --lr 0.01 --epochs 5 --batch_size 10\
+#         --comm_round 10  --test_round 10 --sample_num 2 \
+#         --dataset office --bp_lr 0.01 --epochs 5 --batch_size 10\
 #         --gap_layer 5 \
-#         --bptrain --test \
+#         --bptrain \
 #         --peftmode adapter
 #         --peftmode prompt_tuning 
 #         --peftmode adapter 

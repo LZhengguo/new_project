@@ -1,0 +1,5 @@
+new_project/fedfwd/logs/
+new_project/fedfwd/data/
+new_project/fedfwd/checkpoints/
+new_project/fedfwd/__pycache__/
+new_project/fedfwd/*.xlsx

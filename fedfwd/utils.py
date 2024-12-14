@@ -426,8 +426,9 @@ def use_bp_first(net, args, param_dict):
     optimizer.zero_grad()
     return bp_grad
 
-@timecost
+# @timecost
 def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
+    starttime = time.perf_counter()
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
@@ -449,12 +450,20 @@ def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
     batch_num = len(train_dataloader)
     # print("batch的数量是",batch_num)
     
-    trainable_optimizer = torch.optim.SGD(trainable_tensor, lr=1)
-    head_optimizer = torch.optim.SGD(head_tensor, lr=0.01)
+    if args.m:
+        trainable_optimizer = torch.optim.SGD(trainable_tensor, lr=1, momentum=0.9)
+        head_optimizer = torch.optim.SGD(head_tensor, lr=0.01, momentum=0.9)
+        if param_dict['optim_state'] is not None:
+            trainable_optimizer.load_state_dict(param_dict['optim_state'])
+    else:
+        trainable_optimizer = torch.optim.SGD(trainable_tensor, lr=1)
+        head_optimizer = torch.optim.SGD(head_tensor, lr=0.01)
 
     # with torch.no_grad():
     for epoch in range(args.epochs):
         for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+            if batch_idx==0:
+                trainbegin = time.perf_counter()
             x, labels = x.to(device), labels.to(device)
             labels = labels.long()
             y = net(x)
@@ -473,6 +482,9 @@ def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
                 if k in trainable_para.keys():
                     v.data = trainable_para[k]
 
+            if batch_idx==0:
+                onebatchtime = time.perf_counter() - trainbegin 
+
         torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
         trainable_optimizer.step()
         trainable_optimizer.zero_grad(set_to_none=False)
@@ -485,9 +497,14 @@ def train_local_fwd_test(net, args, param_dict, client_first_grad=None):
     for k, v in net.named_parameters():
         if k in trainable_para.keys():
             v.requires_grad = True
-    return net
+    totaltime = time.perf_counter() - starttime
+    if args.m:
+        state = trainable_optimizer.state_dict()
+        return net, totaltime, onebatchtime, state
+    return net, totaltime, onebatchtime
 
 def train_local_fwd(net, args, param_dict, client_first_grad=None):
+    starttime = time.perf_counter()
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
@@ -500,14 +517,13 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
     net.eval()
 
     batch_num = len(train_dataloader)
-    print("batch的数量是",batch_num)
-    
     optimizer = torch.optim.SGD(trainable_tensor, lr=1)
 
-    starttime = time.perf_counter()
     with torch.no_grad():
         for epoch in range(args.epochs):
             for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+                if batch_idx==0:
+                    trainbegin = time.perf_counter()
                 x, labels = x.to(device), labels.to(device)
                 labels = labels.long()
                 y = net(x)
@@ -515,7 +531,7 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
                 loss = F.cross_entropy(pred, labels)
 
                 for i in range(args.perturb_num):
-                    p_params ={k: torch.randn_like(v) for k, v in trainable_para.items()}
+                    p_params = {k: torch.randn_like(v) for k, v in trainable_para.items()}
                     jvp = computejvp(net, p_params, trainable_para, x, labels, args.h, loss)
 
                     for p, perturb in zip(trainable_tensor, p_params.values()):
@@ -527,12 +543,14 @@ def train_local_fwd(net, args, param_dict, client_first_grad=None):
 
                 torch.nn.utils.clip_grad_norm_(trainable_tensor, 1.0)
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=False)                
+                optimizer.zero_grad(set_to_none=False)
+                
+                if batch_idx==0:
+                    onebatchtime = time.perf_counter() - trainbegin                
                 # log
                 # print("Forward training: epoch = %d, batch_idx = %d/%d, loss = %s" % (epoch, batch_idx, len(train_dataloader), loss_trajectory[batch_idx]))
-    endtime = time.perf_counter() - starttime
-    print("单个epoch耗时",endtime)
-    return net
+    totaltime = time.perf_counter() - starttime
+    return net, totaltime, onebatchtime
 
 ### for fwdllm
 def calculatejvp(x, labels, net, v_params, trainable_para):
@@ -569,6 +587,7 @@ def calculate_var(fwdgrad_list):
     return var
     
 def train_local_fwdllm(net, args, param_dict):
+    init_time = time.perf_counter()
     train_dataloader = param_dict['train_dataloader']
     round = param_dict['round']
     device = args.device
@@ -601,6 +620,9 @@ def train_local_fwdllm(net, args, param_dict):
         with torch.no_grad():
             for epoch in range(args.epochs):
                 for batch_idx, (x,labels,_) in enumerate(train_dataloader):
+                    if batch_idx == 0:
+                        trainoncebegin = time.perf_counter()
+
                     x, labels = x.to(device), labels.to(device)
                     labels = labels.long()
 
@@ -615,6 +637,9 @@ def train_local_fwdllm(net, args, param_dict):
                         fg.add_(jvp*v)
                         if args.var_control and idx == args.layer_id_for_check:
                             grad_for_var_check_list.append(jvp*v)
+                    
+                    if batch_idx == 0:
+                        onebatchtime = time.perf_counter() - trainoncebegin
         
         if args.var_control:
             var = calculate_var(grad_for_var_check_list)
@@ -642,18 +667,21 @@ def train_local_fwdllm(net, args, param_dict):
     grad = {}
     for k,g in zip(trainable_para.keys(),fwdg): 
         grad[k] = g
-    
-    return net, grad
+    totaltime = time.perf_counter() - init_time
+    return net, grad, totaltime, onebatchtime
 
 
     
 
 def train_local_bp(net, args, param_dict):
+    init_time = time.perf_counter()
     train_dataloader = param_dict['train_dataloader']
     criterion = nn.CrossEntropyLoss().to(args.device)
-    optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad], lr=0.01)
+    optimizer = optim.SGD([p for k,p in net.named_parameters() if p.requires_grad], lr=args.bp_lr)
     for epoch in range(args.epochs):
         for batch_idx, (x, target,_) in enumerate(train_dataloader):
+            if batch_idx == 0:
+                trainbegin = time.perf_counter()
             x, target = x.to(args.device), target.to(args.device)
             optimizer.zero_grad()
             target = target.long()
@@ -662,7 +690,10 @@ def train_local_bp(net, args, param_dict):
             loss = criterion(out, target)  
             loss.backward()
             optimizer.step()
-    return net
+            if batch_idx == 0:
+                onebatchtime = time.perf_counter() - trainbegin
+    totaltime = time.perf_counter() - init_time
+    return net, totaltime, onebatchtime
 
 def mkdirs(dirpath):
     try:
